@@ -1,8 +1,13 @@
 //
 //  LRMockApp.swift
-//  LRMock
+//  RawLight
 //
-//  Created by sugartesalas on 2026-10-08.
+//  Application entry point.
+//
+//  Responsibilities kept intentionally tiny:
+//    * create the SwiftData container (schema lives in `CatalogStore`)
+//    * ensure the on-disk library/cache directories exist
+//    * inject shared services and show the root UI
 //
 
 import SwiftUI
@@ -10,23 +15,21 @@ import SwiftData
 
 @main
 struct LRMockApp: App {
-    var sharedModelContainer: ModelContainer = {
-        let schema = Schema([
-            Item.self,
-        ])
-        let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
 
-        do {
-            return try ModelContainer(for: schema, configurations: [modelConfiguration])
-        } catch {
-            fatalError("Could not create ModelContainer: \(error)")
-        }
-    }()
+    private let modelContainer = CatalogStore.makeContainer()
+    private let services = AppServices()
+
+    init() {
+        // Create Documents/Managed and the thumbnail cache up front.
+        try? LibraryLocations.bootstrap()
+    }
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            RootView()
+                .environment(services)
+                .preferredColorScheme(.dark)
         }
-        .modelContainer(sharedModelContainer)
+        .modelContainer(modelContainer)
     }
 }
