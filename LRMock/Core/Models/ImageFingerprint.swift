@@ -19,7 +19,7 @@
 
 import Foundation
 
-struct ImageFingerprint: Codable, Hashable, Sendable {
+nonisolated struct ImageFingerprint: Codable, Hashable, Sendable {
 
     /// Original file name including extension, e.g. `DSCF1234.RAF`.
     var filename: String
@@ -45,7 +45,7 @@ struct ImageFingerprint: Codable, Hashable, Sendable {
     }
 }
 
-extension ImageFingerprint {
+nonisolated extension ImageFingerprint {
 
     /// Confidence that `self` and `other` identify the same physical file.
     /// Used when re-linking a "missing" asset to a freshly imported file.

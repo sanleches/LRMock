@@ -18,7 +18,7 @@
 
 import Foundation
 
-enum BookmarkStore {
+nonisolated enum BookmarkStore {
 
     enum BookmarkError: Error { case resolutionFailed, accessDenied }
 

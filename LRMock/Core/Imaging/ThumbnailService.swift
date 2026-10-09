@@ -2,105 +2,194 @@
 //  ThumbnailService.swift
 //  RawLight
 //
-//  Generates and caches small grid thumbnails.
-//
-//  Strategy
-//  --------
-//  RAW files embed a full-size JPEG preview; ImageIO's
-//  `CGImageSourceCreateThumbnailAtIndex` pulls that (or down-samples the image
-//  if absent) without a full RAW decode — fast enough to run while scrolling.
-//  Results are cached as JPEG in `Caches/Thumbnails/<assetID>.jpg`, keyed by the
-//  asset id, so subsequent launches are instant and the cache can be purged by
-//  the OS without data loss.
-//
-//  This is an `actor` so the in-memory cache and disk writes are serialised
-//  without the caller worrying about threads.
+//  Size-aware thumbnail generation with bounded parallel work, in-flight request
+//  deduplication, an LRU memory budget, and a disposable disk cache.
 //
 
 import Foundation
 import ImageIO
 import CoreGraphics
 import UniformTypeIdentifiers
+import CryptoKit
+
+private actor ThumbnailPermitPool {
+    private var permits: Int
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(permits: Int) {
+        self.permits = permits
+    }
+
+    func acquire() async {
+        if permits > 0 {
+            permits -= 1
+            return
+        }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func release() {
+        if waiters.isEmpty {
+            permits += 1
+        } else {
+            waiters.removeFirst().resume()
+        }
+    }
+}
 
 actor ThumbnailService {
 
     static let shared = ThumbnailService()
 
-    /// Longest-edge pixel size for generated grid thumbnails.
-    private let maxPixelSize = 512
+    private struct CacheKey: Hashable, Sendable {
+        let assetID: UUID
+        let maxPixelSize: Int
+        let sourceVersion: String
+    }
 
-    /// Small in-memory LRU-ish cache to avoid re-reading disk during a scroll.
-    private var memoryCache: [UUID: CGImage] = [:]
-    private var insertionOrder: [UUID] = []
-    private let memoryLimit = 120
+    private struct GeneratedThumbnail: @unchecked Sendable {
+        let image: CGImage?
+    }
 
-    /// Returns a thumbnail for the asset `id`, generating and caching on demand.
-    /// `fileURL` must be an accessible URL to the original bytes (the caller
-    /// resolves bookmarks / scoped access before calling). We key on `UUID`
-    /// rather than the `ImageAsset` so this stays `Sendable`-safe across actors.
-    func thumbnail(for id: UUID, fileURL: URL) -> CGImage? {
-        if let cached = memoryCache[id] { return cached }
+    private let workers = ThumbnailPermitPool(permits: 4)
+    private var memoryCache: [CacheKey: CGImage] = [:]
+    private var recency: [CacheKey] = []
+    private var memoryCost = 0
+    private let memoryCostLimit = 96 * 1024 * 1024
+    private var inFlight: [CacheKey: Task<GeneratedThumbnail, Never>] = [:]
 
-        if let disk = loadFromDisk(id: id) {
-            store(disk, for: id)
-            return disk
+    func thumbnail(
+        for id: UUID,
+        source: AssetFileAccess.Reference,
+        sourceVersion: String,
+        maxPixelSize: Int
+    ) async -> CGImage? {
+        let boundedSize = min(max(maxPixelSize, 64), 1024)
+        let key = CacheKey(
+            assetID: id,
+            maxPixelSize: boundedSize,
+            sourceVersion: sourceVersion
+        )
+        if let cached = memoryCache[key] {
+            touch(key)
+            return cached
+        }
+        if let existing = inFlight[key] {
+            return await existing.value.image
         }
 
-        guard let generated = generate(from: fileURL) else { return nil }
-        writeToDisk(generated, id: id)
-        store(generated, for: id)
-        return generated
+        let cacheURL = diskURL(for: key)
+        let workers = workers
+        let task = Task.detached(priority: .utility) {
+            await workers.acquire()
+            defer { Task { await workers.release() } }
+            if Task.isCancelled { return GeneratedThumbnail(image: nil) }
+            if let disk = Self.loadFromDisk(cacheURL) {
+                return GeneratedThumbnail(image: disk)
+            }
+            guard let handle = try? AssetFileAccess.open(source) else {
+                return GeneratedThumbnail(image: nil)
+            }
+            defer { handle.release() }
+            guard !Task.isCancelled,
+                  let generated = Self.generate(from: handle.url, maxPixelSize: boundedSize)
+            else { return GeneratedThumbnail(image: nil) }
+            Self.writeToDisk(generated, url: cacheURL)
+            return GeneratedThumbnail(image: generated)
+        }
+        inFlight[key] = task
+        let result = await task.value.image
+        inFlight[key] = nil
+        if let result { store(result, for: key) }
+        return result
     }
 
-    /// Removes the cached thumbnail for an asset (e.g. after a re-import).
     func invalidate(_ id: UUID) {
-        memoryCache[id] = nil
-        try? FileManager.default.removeItem(at: diskURL(id: id))
+        for key in memoryCache.keys where key.assetID == id {
+            removeFromMemory(key)
+        }
+        for key in inFlight.keys where key.assetID == id {
+            inFlight[key]?.cancel()
+            inFlight[key] = nil
+        }
+
+        let prefix = id.uuidString + "-"
+        if let files = try? FileManager.default.contentsOfDirectory(
+            at: LibraryLocations.thumbnailsCache,
+            includingPropertiesForKeys: nil
+        ) {
+            for file in files where file.lastPathComponent.hasPrefix(prefix) {
+                try? FileManager.default.removeItem(at: file)
+            }
+        }
     }
 
-    // MARK: Generation
+    // MARK: Generation and disk cache
 
-    private func generate(from url: URL) -> CGImage? {
+    nonisolated private static func generate(from url: URL, maxPixelSize: Int) -> CGImage? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,   // respect EXIF orientation
+            kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
             kCGImageSourceCreateThumbnailFromImageAlways: false
         ]
         return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
     }
 
-    // MARK: Disk cache
-
-    private func diskURL(id: UUID) -> URL {
-        LibraryLocations.thumbnailsCache.appendingPathComponent("\(id.uuidString).jpg")
+    private func diskURL(for key: CacheKey) -> URL {
+        let digest = SHA256.hash(data: Data(key.sourceVersion.utf8))
+            .prefix(8)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return LibraryLocations.thumbnailsCache.appendingPathComponent(
+            "\(key.assetID.uuidString)-\(key.maxPixelSize)-\(digest).jpg"
+        )
     }
 
-    private func loadFromDisk(id: UUID) -> CGImage? {
-        let url = diskURL(id: id)
+    nonisolated private static func loadFromDisk(_ url: URL) -> CGImage? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         return CGImageSourceCreateImageAtIndex(source, 0, nil)
     }
 
-    private func writeToDisk(_ image: CGImage, id: UUID) {
-        let url = diskURL(id: id)
-        guard let dest = CGImageDestinationCreateWithURL(
-            url as CFURL, UTType.jpeg.identifier as CFString, 1, nil
+    nonisolated private static func writeToDisk(_ image: CGImage, url: URL) {
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        guard let destination = CGImageDestinationCreateWithURL(
+            url as CFURL,
+            UTType.jpeg.identifier as CFString,
+            1,
+            nil
         ) else { return }
-        let props: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: 0.8]
-        CGImageDestinationAddImage(dest, image, props as CFDictionary)
-        CGImageDestinationFinalize(dest)
+        let properties: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: 0.82]
+        CGImageDestinationAddImage(destination, image, properties as CFDictionary)
+        _ = CGImageDestinationFinalize(destination)
     }
 
-    // MARK: Memory cache
+    // MARK: Cost-bounded LRU
 
-    private func store(_ image: CGImage, for id: UUID) {
-        memoryCache[id] = image
-        insertionOrder.append(id)
-        if insertionOrder.count > memoryLimit {
-            let evicted = insertionOrder.removeFirst()
-            if evicted != id { memoryCache[evicted] = nil }
+    private func touch(_ key: CacheKey) {
+        recency.removeAll { $0 == key }
+        recency.append(key)
+    }
+
+    private func store(_ image: CGImage, for key: CacheKey) {
+        if memoryCache[key] != nil { removeFromMemory(key) }
+        memoryCache[key] = image
+        memoryCost += image.bytesPerRow * image.height
+        touch(key)
+
+        while memoryCost > memoryCostLimit, let oldest = recency.first {
+            removeFromMemory(oldest)
         }
+    }
+
+    private func removeFromMemory(_ key: CacheKey) {
+        if let image = memoryCache.removeValue(forKey: key) {
+            memoryCost -= image.bytesPerRow * image.height
+        }
+        recency.removeAll { $0 == key }
     }
 }

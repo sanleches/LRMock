@@ -13,7 +13,6 @@ import UniformTypeIdentifiers
 
 struct RootView: View {
     @Environment(\.modelContext) private var modelContext
-    @Environment(AppServices.self) private var services
 
     // Catalog queries used to resolve the current selection.
     @Query(sort: \LibraryFolder.sortIndex) private var folders: [LibraryFolder]
@@ -26,10 +25,20 @@ struct RootView: View {
     @State private var isLoupeOpen = false
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
-    // Import sheets.
-    @State private var showFileImporter = false
-    @State private var showFolderImporter = false
+    // Import. A single `.fileImporter` driven by `importMode` — stacking two
+    // fileImporters on one view conflicts (the later one wins), which on macOS
+    // made "Import Photos" silently do nothing.
+    enum ImportMode { case files, folder }
+    @State private var importMode: ImportMode = .files
+    @State private var showImporter = false
     @State private var importMessage: String?
+    @State private var importMessageID = UUID()
+    @State private var isImporting = false
+    @State private var operationError: String?
+
+    private var importContentTypes: [UTType] {
+        importMode == .folder ? [.folder] : [.image, .rawImage]
+    }
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
@@ -41,16 +50,36 @@ struct RootView: View {
         }
         .tint(Theme.accent)
         .fileImporter(
-            isPresented: $showFileImporter,
-            allowedContentTypes: [.image, .rawImage],
-            allowsMultipleSelection: true
-        ) { handleFileImport($0) }
-        .fileImporter(
-            isPresented: $showFolderImporter,
-            allowedContentTypes: [.folder],
-            allowsMultipleSelection: false
-        ) { handleFolderImport($0) }
+            isPresented: $showImporter,
+            allowedContentTypes: importContentTypes,
+            allowsMultipleSelection: importMode != .folder
+        ) { result in
+            switch importMode {
+            case .files:  handleFileImport(result)
+            case .folder: handleFolderImport(result)
+            }
+        }
         .overlay(alignment: .bottom) { importToast }
+        .alert("Operation Failed", isPresented: Binding(
+            get: { operationError != nil },
+            set: { if !$0 { operationError = nil } }
+        )) {
+            Button("OK", role: .cancel) { operationError = nil }
+        } message: {
+            Text(operationError ?? "Unknown error")
+        }
+        // Picking a folder/collection in the sidebar always returns to its grid,
+        // even from the full-screen editor.
+        .onChange(of: selection) { _, _ in
+            if let selectedAsset { persistSidecar(for: selectedAsset) }
+            selectedAsset = nil
+            if isLoupeOpen {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isLoupeOpen = false
+                    columnVisibility = .all
+                }
+            }
+        }
     }
 
     // MARK: Detail (grid ↔ loupe)
@@ -79,41 +108,34 @@ struct RootView: View {
     private var importToolbar: some ToolbarContent {
         ToolbarItem(placement: .primaryAction) {
             Menu {
-                Picker("Engine", selection: Binding(
-                    get: { services.engine },
-                    set: { services.engine = $0 }
-                )) {
-                    ForEach(PipelineKind.allCases) { kind in
-                        Text(kind.label)
-                            .tag(kind)
-                    }
-                }
-                .pickerStyle(.inline)
-            } label: {
-                Label("Engine", systemImage: "cpu")
-            }
-        }
-
-        ToolbarItem(placement: .primaryAction) {
-            Menu {
                 Button {
-                    showFileImporter = true
+                    importMode = .files
+                    showImporter = true
                 } label: {
-                    Label("Import Files…", systemImage: "doc.badge.plus")
+                    Label("Import Photos (copy to Library)…", systemImage: "square.and.arrow.down.on.square")
                 }
                 Button {
-                    showFolderImporter = true
+                    importMode = .folder
+                    showImporter = true
                 } label: {
-                    Label("Import Folder…", systemImage: "folder.badge.plus")
+                    Label("Reference Folder (keep in place)…", systemImage: "folder.badge.gearshape")
                 }
+                Divider()
                 Button {
-                    scanManagedFolder()
+                    LibraryReveal.revealLibrary()
                 } label: {
-                    Label("Scan RawLight Folder", systemImage: "arrow.clockwise")
+                    Label(LibraryReveal.revealTitle, systemImage: "folder")
                 }
             } label: {
-                Label("Import", systemImage: "square.and.arrow.down")
+                if isImporting {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Label("Import", systemImage: "square.and.arrow.down")
+                }
             }
+            .accessibilityIdentifier("import-menu")
+            .disabled(isImporting)
         }
     }
 
@@ -167,45 +189,71 @@ struct RootView: View {
 
     private func openLoupe(_ asset: ImageAsset) {
         selectedAsset = asset
-        withAnimation(.easeInOut(duration: 0.2)) { isLoupeOpen = true }
+        withAnimation(.easeInOut(duration: 0.25)) {
+            isLoupeOpen = true
+            // Collapse the folder/collection sidebar for a full-width editor.
+            columnVisibility = .detailOnly
+        }
     }
 
     private func closeLoupe() {
         // Persist edits to the portable sidecar when leaving the editor.
         if let asset = selectedAsset { persistSidecar(for: asset) }
-        withAnimation(.easeInOut(duration: 0.2)) { isLoupeOpen = false }
+        withAnimation(.easeInOut(duration: 0.25)) {
+            isLoupeOpen = false
+            // Bring the sidebar back so the user can browse folders again.
+            columnVisibility = .all
+        }
     }
 
     // MARK: Import handlers
 
     private func handleFileImport(_ result: Result<[URL], Error>) {
-        guard case .success(let urls) = result, !urls.isEmpty else { return }
-        let summary = ImportService(modelContext: modelContext)
-            .importFiles(urls, into: selectedFolder, copyIntoLibrary: false)
-        show(summary)
+        switch result {
+        case .success(let urls) where !urls.isEmpty:
+            Task {
+                isImporting = true
+                let summary = await ImportService(modelContext: modelContext)
+                    .importFiles(urls, into: selectedFolder, copyIntoLibrary: true)
+                isImporting = false
+                show(summary)
+            }
+        case .success:
+            break
+        case .failure(let error):
+            operationError = error.localizedDescription
+        }
     }
 
     private func handleFolderImport(_ result: Result<[URL], Error>) {
-        guard case .success(let urls) = result, let folderURL = urls.first else { return }
+        switch result {
+        case .success(let urls):
+            guard let folderURL = urls.first else { return }
+            do {
+                let bookmark = try BookmarkStore.makeBookmark(for: folderURL)
+                let folder = LibraryFolder(
+                    name: folderURL.lastPathComponent,
+                    kind: .external,
+                    sortIndex: folders.count
+                )
+                folder.bookmarkData = bookmark
+                modelContext.insert(folder)
+                try modelContext.save()
 
-        // Create a sidebar folder that references the external directory.
-        let folder = LibraryFolder(
-            name: folderURL.lastPathComponent,
-            kind: .external,
-            sortIndex: folders.count
-        )
-        folder.bookmarkData = try? BookmarkStore.makeBookmark(for: folderURL)
-        modelContext.insert(folder)
-
-        let summary = ImportService(modelContext: modelContext)
-            .importFolder(folderURL, into: folder)
-        selection = .folder(folder.persistentModelID)
-        show(summary)
-    }
-
-    private func scanManagedFolder() {
-        let summary = ImportService(modelContext: modelContext).scanManagedLibrary(into: nil)
-        show(summary)
+                Task {
+                    isImporting = true
+                    let summary = await ImportService(modelContext: modelContext)
+                        .importFolder(folderURL, into: folder)
+                    isImporting = false
+                    selection = .folder(folder.persistentModelID)
+                    show(summary)
+                }
+            } catch {
+                operationError = error.localizedDescription
+            }
+        case .failure(let error):
+            operationError = error.localizedDescription
+        }
     }
 
     // MARK: Actions
@@ -213,12 +261,20 @@ struct RootView: View {
     private func createCollection() {
         let collection = AssetCollection(name: "New Collection", sortIndex: collections.count)
         modelContext.insert(collection)
-        try? modelContext.save()
+        do {
+            try modelContext.save()
+        } catch {
+            modelContext.delete(collection)
+            operationError = error.localizedDescription
+        }
     }
 
     private func persistSidecar(for asset: ImageAsset) {
-        try? AssetFileAccess.withAccess(asset) { url in
-            try SidecarService.write(SidecarService.snapshot(of: asset), for: url)
+        do {
+            try modelContext.save()
+            try EditPersistence.writeSidecar(for: asset)
+        } catch {
+            operationError = error.localizedDescription
         }
     }
 
@@ -226,16 +282,24 @@ struct RootView: View {
         let text = "Imported \(summary.imported)"
             + (summary.skipped > 0 ? " · skipped \(summary.skipped)" : "")
             + (summary.failed > 0 ? " · failed \(summary.failed)" : "")
+        if !summary.errors.isEmpty {
+            operationError = summary.errors.prefix(5).joined(separator: "\n")
+        }
+        let messageID = UUID()
+        importMessageID = messageID
         withAnimation { importMessage = text }
         Task {
             try? await Task.sleep(for: .seconds(2.5))
+            guard importMessageID == messageID else { return }
             withAnimation { importMessage = nil }
         }
     }
 }
 
 #Preview {
+    let container = CatalogStore.makeInMemoryContainer()
     RootView()
-        .modelContainer(CatalogStore.makeInMemoryContainer())
+        .modelContainer(container)
+        .environment(AppServices())
         .preferredColorScheme(.dark)
 }

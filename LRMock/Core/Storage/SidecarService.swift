@@ -19,7 +19,7 @@
 import Foundation
 
 /// The serialisable contents of a `.rawlight` sidecar.
-struct Sidecar: Codable, Sendable {
+nonisolated struct Sidecar: Codable, Sendable {
     var schemaVersion: Int = 1
     var fingerprint: ImageFingerprint
     var develop: DevelopSettings
@@ -28,9 +28,25 @@ struct Sidecar: Codable, Sendable {
     var colorLabel: Int
 }
 
-enum SidecarService {
+nonisolated enum SidecarService {
 
     static let fileExtension = "rawlight"
+    private static let schemaVersion = 1
+    private static let maximumFileSize = 2 * 1024 * 1024
+
+    enum SidecarError: LocalizedError {
+        case unsupportedVersion(Int)
+        case fileTooLarge
+
+        var errorDescription: String? {
+            switch self {
+            case .unsupportedVersion(let version):
+                return "The sidecar uses unsupported version \(version)."
+            case .fileTooLarge:
+                return "The sidecar is larger than the supported limit."
+            }
+        }
+    }
 
     private static let encoder: JSONEncoder = {
         let e = JSONEncoder()
@@ -59,13 +75,23 @@ enum SidecarService {
     }
 
     /// Reads the sidecar if one exists next to the original file.
-    static func read(for originalURL: URL) -> Sidecar? {
+    static func read(for originalURL: URL) throws -> Sidecar? {
         let url = sidecarURL(for: originalURL)
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        return try? decoder.decode(Sidecar.self, from: data)
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let values = try url.resourceValues(forKeys: [.fileSizeKey])
+        guard (values.fileSize ?? 0) <= maximumFileSize else {
+            throw SidecarError.fileTooLarge
+        }
+        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        let sidecar = try decoder.decode(Sidecar.self, from: data)
+        guard sidecar.schemaVersion == schemaVersion else {
+            throw SidecarError.unsupportedVersion(sidecar.schemaVersion)
+        }
+        return sidecar
     }
 
     /// Builds a `Sidecar` snapshot from a catalog asset.
+    @MainActor
     static func snapshot(of asset: ImageAsset) -> Sidecar {
         Sidecar(
             fingerprint: asset.fingerprint,

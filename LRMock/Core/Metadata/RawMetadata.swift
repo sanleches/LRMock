@@ -16,7 +16,7 @@ import UIKit
 
 /// Plain snapshot of a file's capture metadata, copied into `ImageAsset` so the
 /// UI never has to touch the original file to show EXIF.
-struct RawMetadata: Sendable {
+nonisolated struct RawMetadata: Sendable {
     var captureDate: Date?
     var cameraMake: String?
     var cameraModel: String?
@@ -30,7 +30,7 @@ struct RawMetadata: Sendable {
     var orientation: Int = 1
 }
 
-enum MetadataExtractor {
+nonisolated enum MetadataExtractor {
 
     /// Extracts metadata from the file at `url`. Returns an empty-ish value
     /// (dimensions 0) if the file cannot be read, rather than throwing, so a

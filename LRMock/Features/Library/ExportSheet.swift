@@ -2,13 +2,29 @@
 //  ExportSheet.swift
 //  RawLight
 //
-//  Renders the asset at the chosen settings through the active `RawPipeline`
-//  and hands the resulting file to the system share sheet (save to Files, AirDrop,
-//  etc.). All encoding lives in the pipeline; this view is just options + I/O
-//  orchestration.
+//  Renders the asset at the chosen settings through the active `RawPipeline`,
+//  then lets the user save it to a location (native Save panel on macOS, the
+//  document save UI on iPadOS) via `.fileExporter`, or hand it to the share
+//  sheet. All encoding lives in the pipeline; this view is options + I/O.
 //
 
 import SwiftUI
+import UniformTypeIdentifiers
+
+/// Wraps already-encoded image bytes so `.fileExporter` can write them to a
+/// user-chosen destination on any platform.
+struct ExportedImageDocument: FileDocument {
+    static var readableContentTypes: [UTType] { [.jpeg, .heic, .tiff, .png] }
+
+    var data: Data
+    init(data: Data) { self.data = data }
+    init(configuration: ReadConfiguration) throws {
+        data = configuration.file.regularFileContents ?? Data()
+    }
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: data)
+    }
+}
 
 struct ExportSheet: View {
     let asset: ImageAsset
@@ -16,18 +32,20 @@ struct ExportSheet: View {
     @Environment(AppServices.self) private var services
     @Environment(\.dismiss) private var dismiss
 
-    // User-facing option state.
+    // Options.
     @State private var format: ExportOptions.Format = .jpeg
     @State private var colorSpace: ExportOptions.ColorSpace = .sRGB
     @State private var size: SizeChoice = .full
     @State private var quality: Double = 0.9
 
-    // Result state.
+    // Result.
+    @State private var document: ExportedImageDocument?
     @State private var exportedURL: URL?
+    @State private var showExporter = false
     @State private var isExporting = false
-    @State private var errorText: String?
+    @State private var statusText: String?
+    @State private var isError = false
 
-    /// Longest-edge presets offered to the user.
     enum SizeChoice: String, CaseIterable, Identifiable {
         case full = "Full size"
         case px4096 = "4096 px"
@@ -45,6 +63,19 @@ struct ExportSheet: View {
     }
 
     private var isLossy: Bool { format == .jpeg || format == .heic }
+
+    private var outputType: UTType {
+        switch format {
+        case .jpeg: return .jpeg
+        case .heic: return .heic
+        case .tiff: return .tiff
+        case .png:  return .png
+        }
+    }
+
+    private var suggestedName: String {
+        (asset.originalFilename as NSString).deletingPathExtension + "_edited"
+    }
 
     var body: some View {
         NavigationStack {
@@ -72,52 +103,95 @@ struct ExportSheet: View {
                     }
                 }
 
-                if let errorText {
-                    Section { Text(errorText).foregroundStyle(.red) }
+                if let statusText {
+                    Section { Text(statusText).foregroundStyle(isError ? .red : .secondary) }
                 }
 
                 Section {
-                    if let exportedURL {
-                        ShareLink(item: exportedURL) {
-                            Label("Share / Save…", systemImage: "square.and.arrow.up")
-                        }
-                    }
                     Button {
-                        Task { await runExport() }
+                        Task { await exportToFolder() }
                     } label: {
                         HStack {
-                            Text(exportedURL == nil ? "Create Export" : "Re-export")
-                            if isExporting { Spacer(); ProgressView() }
+                            Label("Export to Folder…", systemImage: "square.and.arrow.down")
+                            Spacer()
+                            if isExporting { ProgressView().controlSize(.small) }
                         }
                     }
                     .disabled(isExporting)
+
+                    if let exportedURL {
+                        ShareLink(item: exportedURL) {
+                            Label("Share…", systemImage: "square.and.arrow.up")
+                        }
+                    }
+                } footer: {
+                    Text("Export saves a rendered copy. Your original is never modified.")
                 }
             }
+            .formStyle(.grouped)
             .navigationTitle("Export")
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
+                ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
                 }
             }
         }
-        .presentationDetents([.medium, .large])
-        // Re-rendering invalidates any previous output file.
-        .onChange(of: format) { _, _ in exportedURL = nil }
-        .onChange(of: colorSpace) { _, _ in exportedURL = nil }
-        .onChange(of: size) { _, _ in exportedURL = nil }
-        .onChange(of: quality) { _, _ in exportedURL = nil }
+        .frame(minWidth: 460, idealWidth: 480, minHeight: 540, idealHeight: 560)
+        .fileExporter(
+            isPresented: $showExporter,
+            document: document,
+            contentType: outputType,
+            defaultFilename: suggestedName
+        ) { result in
+            switch result {
+            case .success:
+                statusText = "Exported."; isError = false
+            case .failure:
+                statusText = "Could not save to that location."; isError = true
+            }
+        }
+        .onChange(of: format) { _, _ in invalidate() }
+        .onChange(of: colorSpace) { _, _ in invalidate() }
+        .onChange(of: size) { _, _ in invalidate() }
+        .onChange(of: quality) { _, _ in invalidate() }
     }
 
-    // MARK: Export
+    // MARK: Actions
 
-    private func runExport() async {
-        errorText = nil
+    private func invalidate() {
+        document = nil
+        exportedURL = nil
+        statusText = nil
+    }
+
+    /// Renders the output, then saves it to a user-chosen folder.
+    /// macOS uses a native `NSSavePanel`; iPadOS uses `.fileExporter`.
+    private func exportToFolder() async {
+        guard await render() else { return }
+        #if os(macOS)
+        switch await ExportDestination.runSavePanel(
+            data: document?.data ?? Data(),
+            suggestedName: suggestedName, type: outputType) {
+        case .saved: statusText = "Exported to the chosen folder."; isError = false
+        case .cancelled: statusText = nil
+        case .failed: statusText = "Could not save to that location."; isError = true
+        }
+        #else
+        showExporter = true
+        #endif
+    }
+
+    @discardableResult
+    private func render() async -> Bool {
+        statusText = nil
+        isError = false
         isExporting = true
         defer { isExporting = false }
 
         guard let handle = try? AssetFileAccess.open(asset) else {
-            errorText = "Original file is unavailable."
-            return
+            statusText = "Original file is unavailable."
+            isError = true
+            return false
         }
         defer { handle.release() }
 
@@ -127,21 +201,21 @@ struct ExportSheet: View {
         options.maxPixelSize = size.pixels
         options.quality = quality
 
-        let base = (asset.originalFilename as NSString).deletingPathExtension
         let destination = FileManager.default.temporaryDirectory
-            .appendingPathComponent("\(base)_edited.\(format.rawValue)")
+            .appendingPathComponent("\(suggestedName).\(format.rawValue)")
         try? FileManager.default.removeItem(at: destination)
 
         do {
             let url = try await services.pipeline.export(
-                fileURL: handle.url,
-                settings: asset.develop,
-                options: options,
-                to: destination
-            )
+                fileURL: handle.url, settings: asset.develop,
+                options: options, to: destination)
             exportedURL = url
+            document = ExportedImageDocument(data: try Data(contentsOf: url))
+            return true
         } catch {
-            errorText = "Export failed. Try a different format."
+            statusText = "Export failed. Try a different format."
+            isError = true
+            return false
         }
     }
 }

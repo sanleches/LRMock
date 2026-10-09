@@ -16,12 +16,18 @@ import Foundation
 @MainActor
 enum EditPersistence {
 
-    /// Writes the sidecar next to the asset's original file (best-effort).
-    /// Silently no-ops if the file can't be reached (e.g. external volume
-    /// currently offline) — the catalog remains the live source of truth.
-    static func writeSidecar(for asset: ImageAsset) {
-        try? AssetFileAccess.withAccess(asset) { url in
-            try SidecarService.write(SidecarService.snapshot(of: asset), for: url)
+    /// Persists the asset's edit recipe + culling metadata to the canonical
+    /// location for its storage mode:
+    ///   * managed → the library's `Recipes/<assetID>.rawlight.json`
+    ///   * referenced → a `.rawlight` sidecar next to the external original
+    static func writeSidecar(for asset: ImageAsset) throws {
+        switch asset.storageMode {
+        case .managed:
+            try RecipeStore.write(for: asset)
+        case .referenced:
+            try AssetFileAccess.withAccess(asset) { url in
+                try SidecarService.write(SidecarService.snapshot(of: asset), for: url)
+            }
         }
     }
 }
@@ -34,22 +40,58 @@ enum EditPersistence {
 @Observable
 final class SidecarAutosaver {
 
-    private var pending: Task<Void, Never>?
+    private var pending: [UUID: Task<Void, Never>] = [:]
+    private var assets: [UUID: ImageAsset] = [:]
+    private var tokens: [UUID: UUID] = [:]
+    var lastError: String?
 
     /// Schedules a sidecar write for `asset` after `delay` of no further changes.
     func schedule(_ asset: ImageAsset, delay: Duration = .seconds(1)) {
-        pending?.cancel()
-        pending = Task {
+        let id = asset.id
+        let token = UUID()
+        pending[id]?.cancel()
+        assets[id] = asset
+        tokens[id] = token
+        pending[id] = Task {
             try? await Task.sleep(for: delay)
-            guard !Task.isCancelled else { return }
-            EditPersistence.writeSidecar(for: asset)
+            guard !Task.isCancelled, tokens[id] == token else { return }
+            persist(asset)
+            if tokens[id] == token {
+                pending[id] = nil
+                assets[id] = nil
+                tokens[id] = nil
+            }
         }
     }
 
     /// Cancels any pending write and persists immediately.
     func flush(_ asset: ImageAsset) {
-        pending?.cancel()
-        pending = nil
-        EditPersistence.writeSidecar(for: asset)
+        let id = asset.id
+        pending[id]?.cancel()
+        pending[id] = nil
+        assets[id] = nil
+        tokens[id] = nil
+        persist(asset)
+    }
+
+    func flushAll() {
+        let pendingAssets = Array(assets.values)
+        pending.values.forEach { $0.cancel() }
+        pending.removeAll()
+        assets.removeAll()
+        tokens.removeAll()
+        pendingAssets.forEach(persist)
+    }
+
+    func dismissError() {
+        lastError = nil
+    }
+
+    private func persist(_ asset: ImageAsset) {
+        do {
+            try EditPersistence.writeSidecar(for: asset)
+        } catch {
+            lastError = error.localizedDescription
+        }
     }
 }

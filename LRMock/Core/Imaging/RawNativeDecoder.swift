@@ -34,8 +34,23 @@ nonisolated enum RawNativeDecoder {
     ///
     /// Operations consumed here (and therefore skipped by the creative chain):
     /// exposure, white balance, noise reduction, sharpening.
-    static func developedImage(url: URL, settings s: DevelopSettings) -> CIImage? {
+    static func developedImage(
+        url: URL,
+        settings s: DevelopSettings,
+        maxPixelSize: Int?,
+        quality: PreviewRenderQuality
+    ) -> CIImage? {
         guard let filter = CIRAWFilter(imageURL: url) else { return nil }
+
+        if quality == .interactive {
+            filter.isDraftModeEnabled = true
+        }
+        if let maxPixelSize {
+            let longestEdge = max(filter.nativeSize.width, filter.nativeSize.height)
+            if longestEdge > CGFloat(maxPixelSize), longestEdge > 0 {
+                filter.scaleFactor = Float(CGFloat(maxPixelSize) / longestEdge)
+            }
+        }
 
         // Exposure — normalised ±1 → ±2.5 EV, applied in linear sensor space.
         if s.exposure != 0 {

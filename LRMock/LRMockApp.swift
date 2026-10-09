@@ -16,20 +16,21 @@ import SwiftData
 @main
 struct LRMockApp: App {
 
-    private let modelContainer = CatalogStore.makeContainer()
+    private let catalog = CatalogStore.makeContainer()
     private let services = AppServices()
-
-    init() {
-        // Create Documents/Managed and the thumbnail cache up front.
-        try? LibraryLocations.bootstrap()
-    }
 
     var body: some Scene {
         WindowGroup {
-            RootView()
-                .environment(services)
-                .preferredColorScheme(.dark)
+            Group {
+                if let failure = catalog.failure {
+                    CatalogRecoveryView(failure: failure)
+                } else {
+                    RootView()
+                }
+            }
+            .environment(services)
+            .preferredColorScheme(.dark)
         }
-        .modelContainer(modelContainer)
+        .modelContainer(catalog.container)
     }
 }

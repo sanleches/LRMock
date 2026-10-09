@@ -15,7 +15,22 @@
 
 import Foundation
 
-enum AssetFileAccess {
+nonisolated enum AssetFileAccess {
+
+    /// Sendable location snapshot used by background services without passing a
+    /// SwiftData model across actors.
+    struct Reference: Sendable {
+        let storageMode: StorageMode
+        let managedRelativePath: String?
+        let bookmarkData: Data?
+
+        @MainActor
+        init(asset: ImageAsset) {
+            storageMode = asset.storageMode
+            managedRelativePath = asset.managedRelativePath
+            bookmarkData = asset.bookmarkData
+        }
+    }
 
     /// A resolved, currently-accessible file. Call `release()` exactly once.
     struct Handle {
@@ -31,17 +46,25 @@ enum AssetFileAccess {
     enum AccessError: Error { case unresolved, scopeDenied }
 
     /// Opens the asset's original file, beginning scoped access if required.
+    @MainActor
     static func open(_ asset: ImageAsset) throws -> Handle {
-        switch asset.storageMode {
+        try open(Reference(asset: asset))
+    }
+
+    static func open(_ reference: Reference) throws -> Handle {
+        switch reference.storageMode {
         case .managed:
-            guard let relative = asset.managedRelativePath else {
+            guard let relative = reference.managedRelativePath else {
                 throw AccessError.unresolved
             }
-            let url = LibraryLocations.documents.appendingPathComponent(relative)
+            let url = try LibraryLocations.url(forManagedRelativePath: relative)
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                throw AccessError.unresolved
+            }
             return Handle(url: url, onRelease: {})
 
         case .referenced:
-            guard let data = asset.bookmarkData else { throw AccessError.unresolved }
+            guard let data = reference.bookmarkData else { throw AccessError.unresolved }
             let (url, _) = try BookmarkStore.resolve(data)
             guard url.startAccessingSecurityScopedResource() else {
                 throw AccessError.scopeDenied
@@ -51,6 +74,7 @@ enum AssetFileAccess {
     }
 
     /// Convenience that opens, runs `body`, and always releases access.
+    @MainActor
     static func withAccess<T>(_ asset: ImageAsset, _ body: (URL) throws -> T) throws -> T {
         let handle = try open(asset)
         defer { handle.release() }

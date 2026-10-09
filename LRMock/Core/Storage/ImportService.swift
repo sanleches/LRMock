@@ -2,165 +2,296 @@
 //  ImportService.swift
 //  RawLight
 //
-//  Turns user-picked files into catalog `ImageAsset`s.
-//
-//  For each incoming URL it:
-//    1. Gains (scoped) read access.
-//    2. Reads EXIF metadata + size and builds a re-link fingerprint.
-//    3. Re-uses an existing `.rawlight` sidecar if the file was edited before,
-//       so edits survive re-import.
-//    4. Either copies the file into the managed library or stores a bookmark to
-//       it in place (the default — RAWs are big; don't duplicate 40 MB files).
-//    5. Pre-generates a thumbnail and persists the asset.
-//
-//  Runs on the main actor because it mutates the SwiftData `ModelContext`. The
-//  heavy per-file work (metadata read, copy, thumbnail) is cheap enough for the
-//  import sizes we expect in Phase 0; a future phase can move it to a background
-//  `ModelActor`.
+//  Transactional managed and referenced import. Expensive inspection, hashing,
+//  copying, and directory enumeration run away from the main actor; SwiftData
+//  mutations remain on the main actor.
 //
 
 import Foundation
 import SwiftData
+
+nonisolated private struct InspectedImport: Sendable {
+    let sourceURL: URL
+    let filename: String
+    let fileSize: Int64
+    let metadata: RawMetadata
+    let fingerprint: ImageFingerprint
+    let contentDigest: String
+    let bookmarkData: Data?
+    let sidecar: Sidecar?
+}
 
 @MainActor
 struct ImportService {
 
     let modelContext: ModelContext
 
-    /// Result summary for user feedback.
     struct Summary {
-        var imported: Int = 0
-        var skipped: Int = 0
-        var failed: Int = 0
+        var imported = 0
+        var skipped = 0
+        var failed = 0
+        var errors: [String] = []
     }
 
-    /// Imports `urls` into `folder` (or the loose library when `folder` is nil).
-    /// - Parameter copyIntoLibrary: when true, files are duplicated into the
-    ///   managed library; when false (default) they are referenced in place.
+    enum ImportError: LocalizedError {
+        case duplicate
+        case unsupportedImage
+        case digestMismatch
+        case sidecarMismatch
+
+        var errorDescription: String? {
+            switch self {
+            case .duplicate:
+                return "This file is already in the library."
+            case .unsupportedImage:
+                return "The file is not a supported or readable image."
+            case .digestMismatch:
+                return "The managed copy did not match the selected original."
+            case .sidecarMismatch:
+                return "The adjacent sidecar belongs to a different image."
+            }
+        }
+    }
+
+    /// Imports selected files. Managed import is the default and copies original
+    /// bytes into an atomic staging directory before committing catalog state.
     @discardableResult
     func importFiles(
         _ urls: [URL],
         into folder: LibraryFolder?,
-        copyIntoLibrary: Bool = false
-    ) -> Summary {
+        copyIntoLibrary: Bool = true
+    ) async -> Summary {
         var summary = Summary()
         for url in urls {
             do {
-                try importOne(url, into: folder, copyIntoLibrary: copyIntoLibrary)
+                try await importOne(
+                    url,
+                    into: folder,
+                    copyIntoLibrary: copyIntoLibrary,
+                    manageScope: true
+                )
                 summary.imported += 1
+            } catch ImportError.duplicate {
+                summary.skipped += 1
             } catch {
                 summary.failed += 1
+                summary.errors.append("\(url.lastPathComponent): \(error.localizedDescription)")
             }
         }
-        try? modelContext.save()
         return summary
     }
 
-    /// Imports every supported image inside an external directory, referencing
-    /// each file in place (no copy). The folder's scope is held for the whole
-    /// enumeration so per-file bookmarks can be created.
+    /// References every supported regular image below an external directory.
     @discardableResult
-    func importFolder(_ folderURL: URL, into folder: LibraryFolder?) -> Summary {
+    func importFolder(_ folderURL: URL, into folder: LibraryFolder?) async -> Summary {
         var summary = Summary()
         let scoped = folderURL.startAccessingSecurityScopedResource()
         defer { if scoped { folderURL.stopAccessingSecurityScopedResource() } }
 
-        for url in imageFiles(in: folderURL) {
+        let files = await Task.detached(priority: .userInitiated) {
+            Self.imageFiles(in: folderURL)
+        }.value
+
+        for url in files {
             do {
-                try importOne(url, into: folder, copyIntoLibrary: false, manageScope: false)
+                try await importOne(
+                    url,
+                    into: folder,
+                    copyIntoLibrary: false,
+                    manageScope: false
+                )
                 summary.imported += 1
+            } catch ImportError.duplicate {
+                summary.skipped += 1
             } catch {
                 summary.failed += 1
+                summary.errors.append("\(url.lastPathComponent): \(error.localizedDescription)")
             }
         }
-        try? modelContext.save()
-        return summary
-    }
-
-    /// Imports files the user dropped into the app's RawLight folder (Documents)
-    /// via the Files app, as managed in-place assets (already inside the sandbox,
-    /// so no copy and no bookmark needed). Skips files already in the catalog.
-    @discardableResult
-    func scanManagedLibrary(into folder: LibraryFolder?) -> Summary {
-        var summary = Summary()
-        let existing = Set(
-            ((try? modelContext.fetch(FetchDescriptor<ImageAsset>())) ?? [])
-                .compactMap(\.managedRelativePath)
-        )
-
-        for url in imageFiles(in: LibraryLocations.documents) {
-            let relative = relativePath(of: url)
-            if existing.contains(relative) { summary.skipped += 1; continue }
-            do {
-                try importManagedInPlace(url, relativePath: relative, into: folder)
-                summary.imported += 1
-            } catch {
-                summary.failed += 1
-            }
-        }
-        try? modelContext.save()
         return summary
     }
 
     // MARK: Single file
 
     private func importOne(
-        _ pickedURL: URL,
+        _ sourceURL: URL,
         into folder: LibraryFolder?,
         copyIntoLibrary: Bool,
-        manageScope: Bool = true
-    ) throws {
-        // The document picker hands us a security-scoped URL. For folder imports
-        // the parent directory already holds the scope, so we skip it here.
-        let scoped = manageScope && pickedURL.startAccessingSecurityScopedResource()
-        defer { if scoped { pickedURL.stopAccessingSecurityScopedResource() } }
+        manageScope: Bool
+    ) async throws {
+        let inspected = try await Task.detached(priority: .userInitiated) {
+            try Self.inspect(
+                sourceURL,
+                includeBookmarkAndSidecar: !copyIntoLibrary,
+                manageScope: manageScope
+            )
+        }.value
 
-        let filename = pickedURL.lastPathComponent
-        let size = fileSize(of: pickedURL)
-        let metadata = MetadataExtractor.read(from: pickedURL)
-
-        let fingerprint = ImageFingerprint(
-            filename: filename,
-            fileSizeBytes: size,
-            captureDate: metadata.captureDate
-        )
-
-        // Reuse edits from a sidecar if the file carries one.
-        let existingSidecar = SidecarService.read(for: pickedURL)
-
-        let asset = ImageAsset(
-            originalFilename: filename,
-            storageMode: copyIntoLibrary ? .managed : .referenced,
-            fingerprint: fingerprint,
-            fileSizeBytes: size
-        )
-        apply(metadata, to: asset)
-        if let sidecar = existingSidecar {
-            asset.develop = sidecar.develop
-            asset.rating = sidecar.rating
-            asset.flagRaw = sidecar.flag
-            asset.colorLabel = sidecar.colorLabel
+        guard try !containsAsset(withDigest: inspected.contentDigest) else {
+            throw ImportError.duplicate
         }
 
-        // Persist the bytes according to the chosen storage mode.
-        if copyIntoLibrary {
-            let destination = try copyFile(pickedURL, forFolderNamed: folder?.name)
-            asset.managedRelativePath = relativePath(of: destination)
-            try writeSidecar(for: asset, at: destination)
-        } else {
-            asset.bookmarkData = try BookmarkStore.makeBookmark(for: pickedURL)
-            // Best-effort sidecar next to the original (read-write entitlement).
-            try? writeSidecar(for: asset, at: pickedURL)
+        let assetID = UUID()
+        var managedDirectory: URL?
+        var recipeWritten = false
+
+        do {
+            let asset = ImageAsset(
+                id: assetID,
+                originalFilename: inspected.filename,
+                storageMode: copyIntoLibrary ? .managed : .referenced,
+                fingerprint: inspected.fingerprint,
+                fileSizeBytes: inspected.fileSize
+            )
+            apply(inspected.metadata, to: asset)
+            asset.contentDigest = inspected.contentDigest
+            asset.folder = folder
+
+            if copyIntoLibrary {
+                let destination = try await Task.detached(priority: .userInitiated) {
+                    try Self.copyIntoManagedLibrary(
+                        inspected.sourceURL,
+                        assetID: assetID,
+                        expectedDigest: inspected.contentDigest,
+                        manageScope: manageScope
+                    )
+                }.value
+                managedDirectory = destination.deletingLastPathComponent()
+                asset.managedRelativePath = try LibraryLocations.relativePath(of: destination)
+                try RecipeStore.write(for: asset)
+                recipeWritten = true
+            } else {
+                asset.bookmarkData = inspected.bookmarkData
+                if let sidecar = inspected.sidecar {
+                    asset.develop = sidecar.develop
+                    asset.rating = min(max(sidecar.rating, 0), 5)
+                    asset.flagRaw = PickFlag(rawValue: sidecar.flag)?.rawValue ?? PickFlag.unflagged.rawValue
+                    asset.colorLabel = min(max(sidecar.colorLabel, 0), 5)
+                }
+            }
+
+            modelContext.insert(asset)
+            do {
+                try modelContext.save()
+            } catch {
+                modelContext.delete(asset)
+                try? modelContext.save()
+                throw error
+            }
+        } catch {
+            if recipeWritten { try? RecipeStore.remove(assetID: assetID) }
+            if let managedDirectory {
+                try? FileManager.default.removeItem(at: managedDirectory)
+            }
+            throw error
         }
-
-        asset.folder = folder
-        modelContext.insert(asset)
-
-        // Warm the thumbnail cache so the grid shows the image immediately.
-        pregenerateThumbnail(for: asset)
     }
 
-    // MARK: Steps
+    private func containsAsset(withDigest digest: String) throws -> Bool {
+        var descriptor = FetchDescriptor<ImageAsset>(
+            predicate: #Predicate<ImageAsset> { asset in
+                asset.contentDigest == digest
+            }
+        )
+        descriptor.fetchLimit = 1
+        return try !modelContext.fetch(descriptor).isEmpty
+    }
+
+    // MARK: Background preparation
+
+    nonisolated private static func inspect(
+        _ sourceURL: URL,
+        includeBookmarkAndSidecar: Bool,
+        manageScope: Bool
+    ) throws -> InspectedImport {
+        let scoped = manageScope && sourceURL.startAccessingSecurityScopedResource()
+        defer { if scoped { sourceURL.stopAccessingSecurityScopedResource() } }
+
+        let values = try sourceURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+        guard values.isRegularFile == true, let byteCount = values.fileSize, byteCount > 0 else {
+            throw ImportError.unsupportedImage
+        }
+
+        let metadata = MetadataExtractor.read(from: sourceURL)
+        guard metadata.pixelWidth > 0, metadata.pixelHeight > 0 else {
+            throw ImportError.unsupportedImage
+        }
+
+        let filename = sourceURL.lastPathComponent
+        let fileSize = Int64(byteCount)
+        let fingerprint = ImageFingerprint(
+            filename: filename,
+            fileSizeBytes: fileSize,
+            captureDate: metadata.captureDate
+        )
+        let digest = try ContentDigest.sha256(of: sourceURL)
+
+        var bookmark: Data?
+        var sidecar: Sidecar?
+        if includeBookmarkAndSidecar {
+            bookmark = try BookmarkStore.makeBookmark(for: sourceURL)
+            sidecar = try SidecarService.read(for: sourceURL)
+            if let sidecar, sidecar.fingerprint.match(fingerprint).rawValue < ImageFingerprint.MatchStrength.strong.rawValue {
+                throw ImportError.sidecarMismatch
+            }
+        }
+
+        return InspectedImport(
+            sourceURL: sourceURL,
+            filename: filename,
+            fileSize: fileSize,
+            metadata: metadata,
+            fingerprint: fingerprint,
+            contentDigest: digest,
+            bookmarkData: bookmark,
+            sidecar: sidecar
+        )
+    }
+
+    /// Copies through `Incoming/<transaction>/`, verifies the complete digest,
+    /// then atomically promotes the directory into `Originals/<assetID>/`.
+    nonisolated private static func copyIntoManagedLibrary(
+        _ source: URL,
+        assetID: UUID,
+        expectedDigest: String,
+        manageScope: Bool
+    ) throws -> URL {
+        let scoped = manageScope && source.startAccessingSecurityScopedResource()
+        defer { if scoped { source.stopAccessingSecurityScopedResource() } }
+
+        let fm = FileManager.default
+        let stagingDirectory = LibraryLocations.incoming
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let finalDirectory = LibraryLocations.managedOriginalDirectory(assetID: assetID)
+        let staged = stagingDirectory.appendingPathComponent(
+            source.pathExtension.isEmpty ? "primary" : "primary.\(source.pathExtension.lowercased())"
+        )
+        let destination = LibraryLocations.managedOriginalURL(
+            assetID: assetID,
+            fileExtension: source.pathExtension
+        )
+        var promoted = false
+        defer {
+            if !promoted { try? fm.removeItem(at: stagingDirectory) }
+        }
+
+        try fm.createDirectory(at: LibraryLocations.incoming, withIntermediateDirectories: true)
+        try fm.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
+        try fm.copyItem(at: source, to: staged)
+        guard try ContentDigest.sha256(of: staged) == expectedDigest else {
+            throw ImportError.digestMismatch
+        }
+
+        guard !fm.fileExists(atPath: finalDirectory.path) else {
+            throw CocoaError(.fileWriteFileExists)
+        }
+        try fm.createDirectory(at: LibraryLocations.originals, withIntermediateDirectories: true)
+        try fm.moveItem(at: stagingDirectory, to: finalDirectory)
+        promoted = true
+        return destination
+    }
+
+    // MARK: Metadata and enumeration
 
     private func apply(_ meta: RawMetadata, to asset: ImageAsset) {
         asset.captureDate = meta.captureDate
@@ -176,122 +307,26 @@ struct ImportService {
         asset.exifOrientation = meta.orientation
     }
 
-    private func copyFile(_ source: URL, forFolderNamed folderName: String?) throws -> URL {
-        let directory = folderName.map { LibraryLocations.managedFolder(named: $0) }
-            ?? LibraryLocations.managedRoot
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-
-        var destination = directory.appendingPathComponent(source.lastPathComponent)
-        destination = uniqueURL(destination)
-        try FileManager.default.copyItem(at: source, to: destination)
-        return destination
-    }
-
-    private func writeSidecar(for asset: ImageAsset, at originalURL: URL) throws {
-        let sidecar = SidecarService.snapshot(of: asset)
-        try SidecarService.write(sidecar, for: originalURL)
-    }
-
-    private func pregenerateThumbnail(for asset: ImageAsset) {
-        guard let handle = try? AssetFileAccess.open(asset) else { return }
-        let url = handle.url
-        let id = asset.id
-        asset.thumbnailFileName = "\(id.uuidString).jpg"
-        Task.detached {
-            _ = await ThumbnailService.shared.thumbnail(for: id, fileURL: url)
-            handle.release()
-        }
-    }
-
-    /// Creates a managed asset for a file that already lives inside the sandbox
-    /// (dropped into the RawLight folder). No copy, no bookmark.
-    private func importManagedInPlace(
-        _ url: URL,
-        relativePath: String,
-        into folder: LibraryFolder?
-    ) throws {
-        let filename = url.lastPathComponent
-        let size = fileSize(of: url)
-        let metadata = MetadataExtractor.read(from: url)
-        let fingerprint = ImageFingerprint(
-            filename: filename, fileSizeBytes: size, captureDate: metadata.captureDate
-        )
-
-        let asset = ImageAsset(
-            originalFilename: filename,
-            storageMode: .managed,
-            fingerprint: fingerprint,
-            fileSizeBytes: size
-        )
-        apply(metadata, to: asset)
-        asset.managedRelativePath = relativePath
-
-        if let sidecar = SidecarService.read(for: url) {
-            asset.develop = sidecar.develop
-            asset.rating = sidecar.rating
-            asset.flagRaw = sidecar.flag
-            asset.colorLabel = sidecar.colorLabel
-        } else {
-            try? writeSidecar(for: asset, at: url)
-        }
-
-        asset.folder = folder
-        modelContext.insert(asset)
-        pregenerateThumbnail(for: asset)
-    }
-
-    // MARK: Small utilities
-
-    /// Recursively lists supported image files under a directory.
-    private func imageFiles(in directory: URL) -> [URL] {
-        let keys: [URLResourceKey] = [.isRegularFileKey]
+    nonisolated private static func imageFiles(in directory: URL) -> [URL] {
         guard let enumerator = FileManager.default.enumerator(
-            at: directory, includingPropertiesForKeys: keys,
-            options: [.skipsHiddenFiles]
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
         ) else { return [] }
 
         var result: [URL] = []
-        for case let url as URL in enumerator where Self.supportedExtensions.contains(
-            url.pathExtension.lowercased()
-        ) {
+        for case let url as URL in enumerator {
+            guard supportedExtensions.contains(url.pathExtension.lowercased()),
+                  (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+            else { continue }
             result.append(url)
         }
-        return result
+        return result.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
     }
 
-    /// RAW + common delivered formats we accept on import.
-    private static let supportedExtensions: Set<String> = [
-        // Standard
+    nonisolated static let supportedExtensions: Set<String> = [
         "jpg", "jpeg", "heic", "heif", "tif", "tiff", "png", "dng",
-        // Camera RAW
         "raf", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2",
         "orf", "rw2", "pef", "raw", "rwl", "3fr", "fff", "iiq", "x3f", "gpr"
     ]
-
-    private func fileSize(of url: URL) -> Int64 {
-        let values = try? url.resourceValues(forKeys: [.fileSizeKey])
-        return Int64(values?.fileSize ?? 0)
-    }
-
-    private func relativePath(of url: URL) -> String {
-        let root = LibraryLocations.documents.path
-        return url.path.hasPrefix(root)
-            ? String(url.path.dropFirst(root.count).drop(while: { $0 == "/" }))
-            : url.lastPathComponent
-    }
-
-    /// Appends ` (n)` before the extension until the URL is free.
-    private func uniqueURL(_ url: URL) -> URL {
-        guard FileManager.default.fileExists(atPath: url.path) else { return url }
-        let ext = url.pathExtension
-        let base = url.deletingPathExtension().lastPathComponent
-        let dir = url.deletingLastPathComponent()
-        var index = 1
-        var candidate = url
-        while FileManager.default.fileExists(atPath: candidate.path) {
-            candidate = dir.appendingPathComponent("\(base) (\(index))").appendingPathExtension(ext)
-            index += 1
-        }
-        return candidate
-    }
 }

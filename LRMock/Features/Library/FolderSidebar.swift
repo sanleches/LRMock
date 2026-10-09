@@ -44,7 +44,7 @@ struct FolderSidebar: View {
                 }
             }
 
-            Section {
+            Section("Collections") {
                 if collections.isEmpty {
                     emptyHint("No collections yet")
                 }
@@ -56,22 +56,20 @@ struct FolderSidebar: View {
                     )
                     .tag(LibrarySelection.collection(collection.persistentModelID))
                 }
-            } header: {
-                HStack {
-                    Text("Collections")
-                    Spacer()
-                    Button(action: onNewCollection) {
-                        Image(systemName: "plus")
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(Theme.accent)
+                Button(action: onNewCollection) {
+                    Label("New Collection", systemImage: "plus")
+                        .font(.caption)
                 }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("new-collection-button")
+                .foregroundStyle(Theme.accent)
             }
         }
         .listStyle(.sidebar)
         .scrollContentBackground(.hidden)
         .background(Theme.panel)
         .navigationTitle("RawLight")
+        .accessibilityIdentifier("library-sidebar")
         .tint(Theme.accent)
     }
 

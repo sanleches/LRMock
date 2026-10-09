@@ -53,6 +53,10 @@ final class ImageAsset {
     var fingerprintCaptureDate: Date?
     var fingerprintHeaderHash: String?
 
+    /// Complete cryptographic digest ("sha256:…") of the original bytes. The
+    /// canonical identity for managed originals, recipes, and exports.
+    var contentDigest: String?
+
     // MARK: Cached capture metadata (immutable; read once at import)
     var captureDate: Date?
     var cameraMake: String?
@@ -107,6 +111,7 @@ final class ImageAsset {
         self.fingerprintSize = fingerprint.fileSizeBytes
         self.fingerprintCaptureDate = fingerprint.captureDate
         self.fingerprintHeaderHash = fingerprint.headerHash
+        self.contentDigest = nil
 
         self.captureDate = fingerprint.captureDate
         self.pixelWidth = 0

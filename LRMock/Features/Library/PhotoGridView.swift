@@ -17,6 +17,8 @@ struct PhotoGridView: View {
 
     @Environment(\.modelContext) private var modelContext
     @State private var cellSize: Double = 180
+    @State private var assetPendingRemoval: ImageAsset?
+    @State private var operationError: String?
 
     private var columns: [GridItem] {
         [GridItem(.adaptive(minimum: cellSize, maximum: cellSize * 1.6), spacing: 14)]
@@ -47,6 +49,34 @@ struct PhotoGridView: View {
             }
         }
         .background(Theme.canvas)
+        .accessibilityIdentifier("photo-grid")
+        .confirmationDialog(
+            "Remove Photo?",
+            isPresented: Binding(
+                get: { assetPendingRemoval != nil },
+                set: { if !$0 { assetPendingRemoval = nil } }
+            ),
+            presenting: assetPendingRemoval
+        ) { asset in
+            Button("Remove from Library", role: .destructive) {
+                remove(asset)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { asset in
+            if asset.storageMode == .managed {
+                Text("The managed original and its recipe will move to RawLight Trash so they can be recovered. This does not permanently erase the file.")
+            } else {
+                Text("The catalog record will be removed. The referenced original and its sidecar will remain untouched.")
+            }
+        }
+        .alert("Operation Failed", isPresented: Binding(
+            get: { operationError != nil },
+            set: { if !$0 { operationError = nil } }
+        )) {
+            Button("OK", role: .cancel) { operationError = nil }
+        } message: {
+            Text(operationError ?? "Unknown error")
+        }
     }
 
     // MARK: Context menu
@@ -58,17 +88,17 @@ struct PhotoGridView: View {
         } label: { Label("Open", systemImage: "arrow.up.left.and.arrow.down.right") }
 
         Button {
-            asset.flag = (asset.flag == .picked) ? .unflagged : .picked
+            mutate(asset) { asset.flag = (asset.flag == .picked) ? .unflagged : .picked }
         } label: { Label("Pick", systemImage: "flag") }
 
         Button {
-            asset.flag = (asset.flag == .rejected) ? .unflagged : .rejected
+            mutate(asset) { asset.flag = (asset.flag == .rejected) ? .unflagged : .rejected }
         } label: { Label("Reject", systemImage: "xmark.circle") }
 
         Menu("Rating") {
             ForEach(0...5, id: \.self) { stars in
                 Button {
-                    asset.rating = stars
+                    mutate(asset) { asset.rating = stars }
                 } label: {
                     Text(stars == 0 ? "None" : String(repeating: "★", count: stars))
                 }
@@ -77,20 +107,61 @@ struct PhotoGridView: View {
 
         Divider()
 
+        Button {
+            DevelopClipboard.settings = asset.develop
+        } label: { Label("Copy Settings", systemImage: "doc.on.doc") }
+
+        Button {
+            mutate(asset) { DevelopClipboard.paste(onto: &asset.develop) }
+        } label: { Label("Paste Settings", systemImage: "doc.on.clipboard") }
+            .disabled(DevelopClipboard.settings == nil)
+
+        Divider()
+
         Button(role: .destructive) {
-            remove(asset)
+            assetPendingRemoval = asset
         } label: { Label("Remove from Library", systemImage: "trash") }
     }
 
-    /// Removes the catalog record (and its cached thumbnail). The original file
-    /// is left untouched on disk — a re-scan/import will pick it up again.
     private func remove(_ asset: ImageAsset) {
-        if selectedAsset?.persistentModelID == asset.persistentModelID {
-            selectedAsset = nil
+        var trashReceipt: LibraryTrash.Receipt?
+        do {
+            try modelContext.save()
+            if asset.storageMode == .managed, let relative = asset.managedRelativePath {
+                trashReceipt = try LibraryTrash.moveManagedAsset(
+                    id: asset.id,
+                    originalFilename: asset.originalFilename,
+                    managedRelativePath: relative
+                )
+            }
+
+            let id = asset.id
+            let wasSelected = selectedAsset?.persistentModelID == asset.persistentModelID
+            modelContext.delete(asset)
+            do {
+                try modelContext.save()
+            } catch {
+                modelContext.rollback()
+                try? trashReceipt?.restore()
+                throw error
+            }
+            if wasSelected { selectedAsset = nil }
+            assetPendingRemoval = nil
+            Task { await ThumbnailService.shared.invalidate(id) }
+        } catch {
+            try? trashReceipt?.restore()
+            operationError = error.localizedDescription
         }
-        let id = asset.id
-        modelContext.delete(asset)
-        Task { await ThumbnailService.shared.invalidate(id) }
+    }
+
+    private func mutate(_ asset: ImageAsset, _ mutation: () -> Void) {
+        mutation()
+        do {
+            try modelContext.save()
+            try EditPersistence.writeSidecar(for: asset)
+        } catch {
+            operationError = error.localizedDescription
+        }
     }
 
     private var header: some View {
@@ -132,18 +203,18 @@ struct AssetGridCell: View {
 
     var body: some View {
         VStack(spacing: 6) {
-            ZStack {
-                AsyncThumbnail(asset: asset)
-                    .frame(maxWidth: .infinity)
-                    .aspectRatio(1, contentMode: .fit)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-
-                overlays.padding(6)
-            }
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .strokeBorder(isSelected ? Theme.accent : .clear, lineWidth: 3)
-            )
+            // A fixed-size square defined by `Color.clear`; the thumbnail is an
+            // overlay so its `scaledToFill` overflow is clipped and can never
+            // affect the cell's layout (which was causing cells to collide).
+            Color.clear
+                .aspectRatio(1, contentMode: .fit)
+                .overlay { AsyncThumbnail(asset: asset) }
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .overlay { overlays.padding(6) }
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .strokeBorder(isSelected ? Theme.accent : .clear, lineWidth: 3)
+                )
 
             Text(asset.originalFilename)
                 .font(.caption)
@@ -203,12 +274,13 @@ struct EmptyLibraryState: View {
             Text("No photos here yet")
                 .font(.headline)
                 .foregroundStyle(Theme.textSecondary)
-            Text("Use Import to add RAW files, or drop them into the\nRawLight folder in the Files app and tap Scan.")
+            Text("Use Import to copy photos into RawLight, or reference an existing folder in place.")
                 .font(.subheadline)
                 .multilineTextAlignment(.center)
                 .foregroundStyle(Theme.textTertiary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.canvas)
+        .accessibilityIdentifier("empty-library-state")
     }
 }

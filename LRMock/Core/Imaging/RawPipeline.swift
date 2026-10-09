@@ -5,9 +5,8 @@
 //  The seam between the UI and whatever is actually decoding/processing pixels.
 //
 //  Everything above this protocol (grid, loupe, inspector) depends ONLY on this
-//  abstraction, never on Core Image or Metal directly. That is what lets us ship
-//  Phase 1 on `CoreImagePipeline` and later drop in a `MetalPipeline` built from
-//  RawTherapee-derived kernels without touching a single view.
+//  abstraction, never on Core Image directly — so the imaging backend can evolve
+//  without touching a single view.
 //
 //  A pipeline has two jobs:
 //    1. `renderPreview` – decode + apply `DevelopSettings`, bounded to a max
@@ -23,14 +22,19 @@ import CoreGraphics
 ///
 /// `@unchecked Sendable`: `CGImage` is an immutable, thread-safe Core Graphics
 /// value but is not formally marked `Sendable`; it is safe to pass across actors.
-struct RenderedImage: @unchecked Sendable {
+nonisolated struct RenderedImage: @unchecked Sendable {
     var cgImage: CGImage
     var pixelWidth: Int
     var pixelHeight: Int
 }
 
+nonisolated enum PreviewRenderQuality: Sendable, Equatable {
+    case interactive
+    case settled
+}
+
 /// Options describing a file export.
-struct ExportOptions: Sendable {
+nonisolated struct ExportOptions: Sendable {
     enum Format: String, CaseIterable, Sendable { case jpeg, heic, tiff, png }
     enum ColorSpace: String, CaseIterable, Sendable { case sRGB, displayP3, adobeRGB }
 
@@ -42,7 +46,7 @@ struct ExportOptions: Sendable {
     var quality: Double = 0.9
 }
 
-enum RawPipelineError: Error {
+nonisolated enum RawPipelineError: Error {
     case decodeFailed
     case renderFailed
     case encodeFailed
@@ -50,14 +54,15 @@ enum RawPipelineError: Error {
 }
 
 /// The contract every imaging backend implements.
-protocol RawPipeline: Sendable {
+nonisolated protocol RawPipeline: Sendable {
 
     /// Decodes `fileURL` and applies `settings`, limited to `maxPixelSize` on the
     /// longest edge for responsive on-screen preview.
     func renderPreview(
         fileURL: URL,
         settings: DevelopSettings,
-        maxPixelSize: Int
+        maxPixelSize: Int,
+        quality: PreviewRenderQuality
     ) async throws -> RenderedImage
 
     /// Full-resolution render encoded to a file, returned as the output URL.
@@ -67,4 +72,19 @@ protocol RawPipeline: Sendable {
         options: ExportOptions,
         to destination: URL
     ) async throws -> URL
+}
+
+extension RawPipeline {
+    func renderPreview(
+        fileURL: URL,
+        settings: DevelopSettings,
+        maxPixelSize: Int
+    ) async throws -> RenderedImage {
+        try await renderPreview(
+            fileURL: fileURL,
+            settings: settings,
+            maxPixelSize: maxPixelSize,
+            quality: .settled
+        )
+    }
 }
