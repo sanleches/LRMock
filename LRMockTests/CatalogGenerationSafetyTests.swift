@@ -485,6 +485,58 @@ struct CatalogGenerationSafetyTests {
         }
     }
 
+    @Test func partialTargetWithoutCatalogIsRotatedWhenSourceContentChanges() throws {
+        let roots = makeRoots()
+        defer { remove(roots) }
+        let sourceGenerationID = UUID()
+        let sourceGeneration = generationURL(sourceGenerationID, in: roots.app)
+        let sourceCatalog = catalogURL(in: sourceGeneration)
+        let sourceState = sourceGeneration.appendingPathComponent("ExportState/state.json")
+        try FileManager.default.createDirectory(
+            at: sourceCatalog.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: sourceState.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        _ = try writeV4Catalog(at: sourceCatalog)
+        try Data("initial state".utf8).write(to: sourceState)
+
+        LibraryLocations.configureRoots(appRoot: roots.app, cacheRoot: roots.cache)
+        let staleTargetGenerationID: UUID
+        do {
+            let source = try LibraryLocations.prepareCatalog()
+            let target = try LibraryLocations.prepareMigrationTarget(from: source)
+            staleTargetGenerationID = target.generationID
+            #expect(try Data(
+                contentsOf: target.generationURL
+                    .appendingPathComponent("ExportState/state.json")
+            ) == Data("initial state".utf8))
+            LibraryLocations.abandonCatalogOpen(target)
+        }
+        LibraryLocations.resetConfiguredRoots()
+        try Data("updated state".utf8).write(to: sourceState, options: .atomic)
+
+        try withConfiguredRoots(roots) {
+            let result = CatalogStore.makeContainer(legacyStoreURL: nil)
+            try #require(result.failure == nil)
+            #expect(LibraryLocations.currentGeneration.lastPathComponent
+                != staleTargetGenerationID.uuidString)
+            #expect(try Data(
+                contentsOf: LibraryLocations.currentGeneration
+                    .appendingPathComponent("ExportState/state.json")
+            ) == Data("updated state".utf8))
+        }
+
+        let staleTarget = generationURL(staleTargetGenerationID, in: roots.app)
+        #expect(FileManager.default.fileExists(
+            atPath: staleTarget.appendingPathComponent(
+                "CatalogMigration.abandoned.json"
+            ).path
+        ))
+    }
+
     @Test func interruptedLegacyTargetIsRebuiltWhenItsSourceAdvances() throws {
         let roots = makeRoots()
         let legacyDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(
@@ -562,6 +614,13 @@ struct CatalogGenerationSafetyTests {
                 into: target
             )
             staleTargetGenerationID = migration.preparation.generationID
+            let staleState = migration.preparation.generationURL
+                .appendingPathComponent("ExportState/state.json")
+            try FileManager.default.createDirectory(
+                at: staleState.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try Data("stale state".utf8).write(to: staleState)
             try Data("""
             { "schemaVersion": 1, "generationID": "\(staleTargetGenerationID.uuidString)" }
             """.utf8).write(
@@ -572,8 +631,18 @@ struct CatalogGenerationSafetyTests {
         LibraryLocations.resetConfiguredRoots()
 
         try appendV4Asset(to: legacy)
+        let pointer = roots.app.appendingPathComponent("CurrentLibrary.json")
+        let damagedPointer = Data("damaged pointer".utf8)
+        try damagedPointer.write(to: pointer)
 
         try withConfiguredRoots(roots) {
+            let unavailable = CatalogStore.makeContainer(legacyStoreURL: nil)
+            let preservedPointer = try Data(contentsOf: pointer)
+            #expect(unavailable.failure?.message.contains("unavailable") == true)
+            #expect(preservedPointer == damagedPointer)
+        }
+
+        let publishedGenerationID: UUID = try withConfiguredRoots(roots) {
             let result = CatalogStore.makeContainer(
                 legacyStoreURL: legacy,
                 legacyLibraryRoot: legacyDirectory
@@ -583,7 +652,72 @@ struct CatalogGenerationSafetyTests {
                 != staleTargetGenerationID.uuidString)
             let context = ModelContext(result.container)
             #expect(try context.fetchCount(FetchDescriptor<ImageAsset>()) == 3)
+            #expect(!FileManager.default.fileExists(
+                atPath: LibraryLocations.currentGeneration
+                    .appendingPathComponent("ExportState/state.json").path
+            ))
+            return try #require(UUID(
+                uuidString: LibraryLocations.currentGeneration.lastPathComponent
+            ))
         }
+
+        let staleTarget = generationURL(staleTargetGenerationID, in: roots.app)
+        #expect(FileManager.default.fileExists(
+            atPath: staleTarget.appendingPathComponent(
+                "CatalogMigration.abandoned.json"
+            ).path
+        ))
+        try FileManager.default.removeItem(at: pointer)
+
+        try withConfiguredRoots(roots) {
+            let result = CatalogStore.makeContainer(legacyStoreURL: nil)
+            try #require(result.failure == nil)
+            #expect(LibraryLocations.currentGeneration.lastPathComponent
+                == publishedGenerationID.uuidString)
+        }
+    }
+
+    @Test func completedAbandonedTargetDoesNotBlockLaterMigration() throws {
+        let roots = makeRoots()
+        defer { remove(roots) }
+        let sourceGenerationID = try initializeFreshLibrary(roots)
+        let abandonedGenerationID = UUID()
+        let abandonedGeneration = generationURL(abandonedGenerationID, in: roots.app)
+        let abandonedCatalog = catalogURL(in: abandonedGeneration)
+        try FileManager.default.createDirectory(
+            at: abandonedCatalog.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try writeCurrentCatalog(at: abandonedCatalog)
+        try Data("""
+        { "schemaVersion": 1, "generationID": "\(abandonedGenerationID.uuidString)" }
+        """.utf8).write(to: completionMarkerURL(in: abandonedGeneration))
+        try Data("""
+        {
+          "schemaVersion": 1,
+          "sourceGenerationID": "\(sourceGenerationID.uuidString)",
+          "targetGenerationID": "\(abandonedGenerationID.uuidString)"
+        }
+        """.utf8).write(
+            to: abandonedGeneration.appendingPathComponent("CatalogMigration.target.json")
+        )
+        try Data("""
+        {
+          "schemaVersion": 1,
+          "generationID": "\(abandonedGenerationID.uuidString)",
+          "ownerPID": \(Int32.max)
+        }
+        """.utf8).write(
+            to: abandonedGeneration.appendingPathComponent("CatalogMigration.abandoned.json")
+        )
+
+        try withConfiguredRoots(roots) {
+            let source = try LibraryLocations.prepareCatalog()
+            let target = try LibraryLocations.prepareMigrationTarget(from: source)
+            #expect(target.generationID != abandonedGenerationID)
+            LibraryLocations.abandonCatalogOpen(target)
+        }
+        #expect(FileManager.default.fileExists(atPath: abandonedGeneration.path))
     }
 
     @Test func validatedCurrentCatalogRecoversBeforeItsMigrationMarkerIsWritten() throws {
@@ -1794,6 +1928,14 @@ struct CatalogGenerationSafetyTests {
         try markerData.write(
             to: restoredRoots.app.appendingPathComponent("LegacyCatalogMigration.json")
         )
+
+        withConfiguredRoots(restoredRoots) {
+            let unavailable = CatalogStore.makeContainer(legacyStoreURL: nil)
+            #expect(unavailable.failure?.message.contains("unavailable") == true)
+            #expect(!FileManager.default.fileExists(
+                atPath: restoredRoots.app.appendingPathComponent("CurrentLibrary.json").path
+            ))
+        }
 
         try withConfiguredRoots(restoredRoots) {
             let result = CatalogStore.makeContainer(

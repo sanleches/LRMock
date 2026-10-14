@@ -372,7 +372,6 @@ struct LoupeStage: View {
                 perform: {}
             )
             .overlay(alignment: .top) { if showingOriginal { beforeBadge } }
-            .animation(.easeOut(duration: 0.12), value: showingOriginal)
             .help(stageHelp)
             .accessibilityLabel("Photo preview, \(asset.originalFilename)")
             .accessibilityValue(accessibilityZoomValue(displayedZoom.scale))
