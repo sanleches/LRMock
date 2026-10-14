@@ -84,7 +84,7 @@ nonisolated enum CatalogV4Migration {
         let byteCount: Int64
     }
 
-    private struct ManagedFilesIdentity: Codable, Equatable {
+    struct ManagedFilesIdentity: Codable, Equatable {
         let managedAssetCount: Int
         let sha256: String
     }
@@ -925,7 +925,8 @@ nonisolated enum CatalogV4Migration {
         let sourceLease = try SourceLease(at: storeURL)
         let target = try LibraryLocations.prepareMigrationTarget(
             from: preparation,
-            sourceLease: sourceLease
+            sourceLease: sourceLease,
+            abandonSourceOnCommit: inheritedLegacyMigration != nil
         )
         if FileManager.default.fileExists(atPath: target.catalogURL.path),
            try storeFormat(at: target.catalogURL) == .current,
@@ -974,11 +975,16 @@ nonisolated enum CatalogV4Migration {
             )
         }
         let sourceLease = try SourceLease(at: sourceURL)
+        let managedFilesIdentity = try liveLegacyManagedFilesIdentity(
+            sourceLease: sourceLease,
+            legacyLibraryRoot: legacyLibraryRoot
+        )
         return try migrateLegacyStore(
             at: sourceURL,
             legacyLibraryRoot: legacyLibraryRoot,
             into: preparation,
-            sourceLease: sourceLease
+            sourceLease: sourceLease,
+            managedFilesIdentity: managedFilesIdentity
         )
     }
 
@@ -994,17 +1000,23 @@ nonisolated enum CatalogV4Migration {
             )
         }
         let sourceLease = try SourceLease(at: sourceURL)
+        let managedFilesIdentity = try liveLegacyManagedFilesIdentity(
+            sourceLease: sourceLease,
+            legacyLibraryRoot: legacyLibraryRoot
+        )
         let target = try LibraryLocations.prepareMigrationTarget(
             from: preparation,
             sourceLease: sourceLease,
             copiesSourceGenerationContent: !preparation.requiresLegacySourceRevalidation,
-            abandonSourceOnCommit: preparation.requiresLegacySourceRevalidation
+            abandonSourceOnCommit: true,
+            expectedLegacyManagedFilesIdentity: managedFilesIdentity
         )
         return try migrateLegacyStore(
             at: sourceURL,
             legacyLibraryRoot: legacyLibraryRoot,
             into: target,
-            sourceLease: sourceLease
+            sourceLease: sourceLease,
+            managedFilesIdentity: managedFilesIdentity
         )
     }
 
@@ -1012,14 +1024,16 @@ nonisolated enum CatalogV4Migration {
         at sourceURL: URL,
         legacyLibraryRoot: URL?,
         into preparation: LibraryLocations.CatalogPreparation,
-        sourceLease: SourceLease
+        sourceLease: SourceLease,
+        managedFilesIdentity: ManagedFilesIdentity
     ) throws -> MigrationResult {
         if FileManager.default.fileExists(atPath: preparation.catalogURL.path) {
             guard try storeFormat(at: preparation.catalogURL) == .current,
                   try isValidatedInterruptedCurrentCatalog(
-                    at: preparation.catalogURL,
-                    generationID: preparation.generationID,
-                    sourceLease: sourceLease
+                     at: preparation.catalogURL,
+                     generationID: preparation.generationID,
+                     sourceLease: sourceLease,
+                     expectedLegacyManagedFilesIdentity: managedFilesIdentity
                   ),
                   let pending = try pendingLegacyMigration(
                     at: preparation.catalogURL,
@@ -1041,7 +1055,7 @@ nonisolated enum CatalogV4Migration {
             into: preparation,
             sourceKind: .legacyDefault,
             markerSourceIdentity: nil,
-            markerManagedFilesIdentity: nil,
+            markerManagedFilesIdentity: managedFilesIdentity,
             legacyLibraryRoot: legacyLibraryRoot,
             sourceLease: sourceLease
         )
@@ -1617,7 +1631,8 @@ nonisolated enum CatalogV4Migration {
     static func isValidatedInterruptedCurrentCatalog(
         at storeURL: URL,
         generationID: UUID,
-        sourceLease: SourceLease? = nil
+        sourceLease: SourceLease? = nil,
+        expectedLegacyManagedFilesIdentity: ManagedFilesIdentity? = nil
     ) throws -> Bool {
         let catalogDirectory = storeURL.deletingLastPathComponent()
         guard let currentMarker = try readMigrationMarker(in: catalogDirectory),
@@ -1627,6 +1642,10 @@ nonisolated enum CatalogV4Migration {
               validSourceIdentity(currentMarker.sourceIdentity),
               validManagedFilesMetadata(currentMarker)
         else { return false }
+        if let expectedLegacyManagedFilesIdentity,
+           currentMarker.managedFilesIdentity != expectedLegacyManagedFilesIdentity {
+            return false
+        }
 
         let backupDirectory = catalogDirectory.deletingLastPathComponent().appendingPathComponent(
             backupDirectoryPrefix + currentMarker.migrationID.uuidString,
@@ -2392,6 +2411,54 @@ nonisolated enum CatalogV4Migration {
         )
     }
 
+    private static func liveLegacyManagedFilesIdentity(
+        sourceLease: SourceLease,
+        legacyLibraryRoot: URL?
+    ) throws -> ManagedFilesIdentity {
+        let directory = try makeTemporaryWorkspaceDirectory(
+            prefix: temporaryRecoveryDirectoryPrefix
+        )
+        let snapshotURL = directory.appendingPathComponent("catalog.store")
+        try sourceLease.backup(to: snapshotURL)
+        let snapshot = try snapshotLegacyStoreCopy(at: snapshotURL)
+        let managedAssets = snapshot.assets.values
+            .filter { $0.storageMode == StorageMode.managed.rawValue }
+            .sorted { $0.id.uuidString < $1.id.uuidString }
+        guard !managedAssets.isEmpty else {
+            return try managedFilesIdentity(for: [])
+        }
+        guard let legacyLibraryRoot else {
+            throw MigrationError.invalidSource("the legacy managed-file root is unavailable")
+        }
+
+        let rootValues = try legacyLibraryRoot.resourceValues(
+            forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+        )
+        guard rootValues.isDirectory == true, rootValues.isSymbolicLink != true else {
+            throw MigrationError.invalidSource(
+                "the legacy managed-file root is not a regular directory: \(legacyLibraryRoot.path)"
+            )
+        }
+        let canonicalRoot = legacyLibraryRoot.resolvingSymlinksInPath().standardizedFileURL
+        var entries: [ManagedFileManifestEntry] = []
+        for asset in managedAssets {
+            let source = try legacyManagedSource(
+                for: asset,
+                root: legacyLibraryRoot,
+                canonicalRoot: canonicalRoot
+            )
+            entries.append(ManagedFileManifestEntry(
+                assetID: asset.id,
+                relativePath: source.relativePath,
+                originalByteCount: source.originalByteCount,
+                originalSHA256: source.originalSHA256,
+                sidecarByteCount: source.sidecarByteCount,
+                sidecarSHA256: source.sidecarSHA256
+            ))
+        }
+        return try managedFilesIdentity(for: entries)
+    }
+
     private static func validateMigratedManagedFiles(
         snapshot: CatalogSnapshot,
         in generationDirectory: URL,
@@ -2954,6 +3021,16 @@ nonisolated enum CatalogV4Migration {
                 managedFilesIdentity: managedFilesIdentity
             )
         }
+    }
+
+    static func pendingLegacySourceIdentity(
+        at storeURL: URL,
+        generationID: UUID
+    ) throws -> SourceIdentity? {
+        try pendingLegacyMigration(
+            at: storeURL,
+            generationID: generationID
+        )?.sourceIdentity
     }
 
     private static func readMigrationMarker(in directory: URL) throws -> MigrationMarker? {

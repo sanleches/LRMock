@@ -65,6 +65,12 @@ nonisolated enum LibraryLocations {
         var ownerPID: Int32
     }
 
+    private struct UITestRootOwner: Codable {
+        var schemaVersion: Int
+        var rootID: UUID
+        var ownerPID: Int32
+    }
+
     private struct CatalogResolution {
         let generationID: UUID
         let generationURL: URL
@@ -191,6 +197,9 @@ nonisolated enum LibraryLocations {
     private static let abandonedMigrationMarkerName = "CatalogMigration.abandoned.json"
     private static let uiTestRootEnvironmentKey = "RAWLIGHT_UI_TEST_ROOT_ID"
     private static let uiTestPointerVersionEnvironmentKey = "RAWLIGHT_UI_TEST_POINTER_SCHEMA_VERSION"
+    private static let uiTestAppRootPrefix = "RawLight-UITests-"
+    private static let uiTestCacheRootPrefix = "RawLight-UICache-"
+    private static let uiTestOwnerMarkerName = ".RawLight.ui-test-owner.json"
     private static let sqliteHeader = Data("SQLite format 3\0".utf8)
     private static let lock = NSLock()
     private static var cachedResolution: CatalogResolution?
@@ -388,6 +397,7 @@ nonisolated enum LibraryLocations {
     /// Only a genuinely empty first-run layout is allowed to create a store.
     static func prepareCatalog() throws -> CatalogPreparation {
         let root = appRoot.standardizedFileURL
+        try prepareUITestRootsIfNeeded()
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try installUITestPointerIfRequested(appRoot: root)
         let generationLock = try GenerationLockLease.acquire(at: root)
@@ -502,7 +512,8 @@ nonisolated enum LibraryLocations {
         }
 
         if let completedMigrationIntent,
-           completedMigrationIntent.abandonSourceOnCommit == true {
+           completedMigrationIntent.abandonSourceOnCommit == true
+            || legacySourceIdentity != nil {
             try markMigrationTargetAbandoned(
                 generationID: completedMigrationIntent.sourceGenerationID,
                 appRoot: preparation.appRootURL
@@ -555,7 +566,8 @@ nonisolated enum LibraryLocations {
         from source: CatalogPreparation,
         sourceLease: CatalogV4Migration.SourceLease? = nil,
         copiesSourceGenerationContent: Bool = true,
-        abandonSourceOnCommit: Bool = false
+        abandonSourceOnCommit: Bool = false,
+        expectedLegacyManagedFilesIdentity: CatalogV4Migration.ManagedFilesIdentity? = nil
     ) throws -> CatalogPreparation {
         try requireGenerationLock(source)
         lock.lock()
@@ -637,7 +649,8 @@ nonisolated enum LibraryLocations {
                 from: source,
                 sourceLease: sourceLease,
                 copiesSourceGenerationContent: copiesSourceGenerationContent,
-                abandonSourceOnCommit: abandonSourceOnCommit
+                abandonSourceOnCommit: abandonSourceOnCommit,
+                expectedLegacyManagedFilesIdentity: expectedLegacyManagedFilesIdentity
             )
         }
 
@@ -664,7 +677,8 @@ nonisolated enum LibraryLocations {
                     && CatalogV4Migration.isValidatedInterruptedCurrentCatalog(
                         at: target.catalogURL,
                         generationID: target.generationID,
-                        sourceLease: sourceLease
+                        sourceLease: sourceLease,
+                        expectedLegacyManagedFilesIdentity: expectedLegacyManagedFilesIdentity
                     )
             } catch {
                 reusable = false
@@ -766,16 +780,108 @@ nonisolated enum LibraryLocations {
     private static var uiTestRoot: URL? {
         guard let uiTestRootID else { return nil }
         return FileManager.default.temporaryDirectory
-            .appendingPathComponent("RawLight-UITests-\(uiTestRootID.uuidString)", isDirectory: true)
+            .appendingPathComponent(
+                uiTestAppRootPrefix + uiTestRootID.uuidString,
+                isDirectory: true
+            )
             .standardizedFileURL
     }
 
     private static var uiTestCacheRoot: URL? {
         guard let uiTestRootID else { return nil }
         return FileManager.default.temporaryDirectory
-            .appendingPathComponent("RawLight-UICache-\(uiTestRootID.uuidString)", isDirectory: true)
+            .appendingPathComponent(
+                uiTestCacheRootPrefix + uiTestRootID.uuidString,
+                isDirectory: true
+            )
             .standardizedFileURL
     }
+
+    private static func prepareUITestRootsIfNeeded() throws {
+        #if DEBUG
+        guard let rootID = uiTestRootID,
+              let appRoot = uiTestRoot,
+              let cacheRoot = uiTestCacheRoot
+        else { return }
+
+        let temporaryDirectory = FileManager.default.temporaryDirectory.standardizedFileURL
+        cleanupStaleUITestRoots(in: temporaryDirectory, preserving: rootID)
+        for root in [appRoot, cacheRoot] {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            let values = try root.resourceValues(
+                forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+            )
+            guard values.isDirectory == true, values.isSymbolicLink != true else {
+                throw LocationError.invalidCatalogMetadata(root)
+            }
+            let marker = root.appendingPathComponent(uiTestOwnerMarkerName)
+            if let data = try readCatalogMetadataIfPresent(at: marker) {
+                guard let owner = try? JSONDecoder().decode(UITestRootOwner.self, from: data),
+                      owner.schemaVersion == 1,
+                      owner.rootID == rootID,
+                      owner.ownerPID > 0
+                else {
+                    throw LocationError.invalidCatalogMetadata(marker)
+                }
+                if owner.ownerPID != getpid(), processIsRunning(owner.ownerPID) {
+                    throw LocationError.libraryInUse
+                }
+            }
+            let owner = UITestRootOwner(
+                schemaVersion: 1,
+                rootID: rootID,
+                ownerPID: getpid()
+            )
+            try JSONEncoder().encode(owner).write(to: marker, options: [.atomic])
+        }
+        #endif
+    }
+
+    #if DEBUG
+    static func cleanupStaleUITestRoots(
+        in temporaryDirectory: URL,
+        preserving currentRootID: UUID
+    ) {
+        let fileManager = FileManager.default
+        guard let entries = try? fileManager.contentsOfDirectory(
+            at: temporaryDirectory,
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        for entry in entries {
+            let name = entry.lastPathComponent
+            let prefix: String
+            if name.hasPrefix(uiTestAppRootPrefix) {
+                prefix = uiTestAppRootPrefix
+            } else if name.hasPrefix(uiTestCacheRootPrefix) {
+                prefix = uiTestCacheRootPrefix
+            } else {
+                continue
+            }
+            guard let rootID = UUID(uuidString: String(name.dropFirst(prefix.count))),
+                  rootID.uuidString == String(name.dropFirst(prefix.count)),
+                  rootID != currentRootID,
+                  let values = try? entry.resourceValues(
+                    forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+                  ),
+                  values.isDirectory == true,
+                  values.isSymbolicLink != true,
+                  let data = try? BoundedFileReader.readRegularFile(
+                    at: entry.appendingPathComponent(uiTestOwnerMarkerName),
+                    maximumByteCount: metadataMaximumByteCount
+                  ),
+                  let owner = try? JSONDecoder().decode(UITestRootOwner.self, from: data),
+                  owner.schemaVersion == 1,
+                  owner.rootID == rootID,
+                  owner.ownerPID > 0,
+                  owner.ownerPID != getpid(),
+                  !processIsRunning(owner.ownerPID)
+            else { continue }
+            try? fileManager.removeItem(at: entry)
+        }
+    }
+    #endif
 
     private static func installUITestPointerIfRequested(appRoot: URL) throws {
         #if DEBUG
@@ -982,6 +1088,8 @@ nonisolated enum LibraryLocations {
         var interruptedMigration: [RecoveryCandidate] = []
         var interruptedFresh: [RecoveryCandidate] = []
         var sawUnclassifiedCatalog = false
+        var abandonedGenerationCount = 0
+        var nonAbandonedGenerationCount = 0
         for entry in entries {
             guard let id = UUID(uuidString: entry.lastPathComponent) else { continue }
             sawGeneration = true
@@ -990,15 +1098,20 @@ nonisolated enum LibraryLocations {
             }
 
             let values = try entry.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-            guard values.isDirectory == true, values.isSymbolicLink != true else { continue }
+            guard values.isDirectory == true, values.isSymbolicLink != true else {
+                nonAbandonedGenerationCount += 1
+                continue
+            }
             let paths = try validatedGenerationPaths(generationID: id, appRoot: appRoot)
             if try isAbandonedMigrationTarget(
                 generationID: id,
                 generationURL: paths.generation,
                 canonicalGeneration: paths.canonicalGeneration
             ) {
+                abandonedGenerationCount += 1
                 continue
             }
+            nonAbandonedGenerationCount += 1
             let isPendingMigrationTarget = try migrationIntent.map {
                 try migrationTargetMarkerMatches(
                     $0,
@@ -1162,6 +1275,16 @@ nonisolated enum LibraryLocations {
         if let interruptedFresh = interruptedFresh.first {
             return interruptedFresh
         }
+        if abandonedGenerationCount > 0,
+           nonAbandonedGenerationCount == 0,
+           migrationIntent == nil {
+            return RecoveryCandidate(
+                generationID: UUID(),
+                kind: .interruptedFresh,
+                allowsCatalogCreation: true,
+                migrationSourceURL: nil
+            )
+        }
         guard sawGeneration else {
             return nil
         }
@@ -1175,6 +1298,13 @@ nonisolated enum LibraryLocations {
         shouldPublishPointer: Bool
     ) throws -> CatalogResolution {
         let paths = try validatedGenerationPaths(generationID: id, appRoot: appRoot)
+        guard try !isAbandonedMigrationTarget(
+            generationID: id,
+            generationURL: paths.generation,
+            canonicalGeneration: paths.canonicalGeneration
+        ) else {
+            throw LocationError.catalogNotInitialized(id)
+        }
         try CatalogV4Migration.recoverInterruptedMigration(
             in: paths.generation,
             generationID: id,
@@ -1232,7 +1362,8 @@ nonisolated enum LibraryLocations {
             allowsCatalogCreation: candidate.allowsCatalogCreation,
             shouldPublishPointer: true,
             needsCompletionMarker: candidate.kind != .completed,
-            needsCreationMarker: false,
+            needsCreationMarker: candidate.kind == .interruptedFresh
+                && candidate.allowsCatalogCreation,
             migrationSourceURL: candidate.migrationSourceURL,
             requiresLegacySourceRevalidation: true
         )

@@ -65,6 +65,67 @@ struct CatalogGenerationSafetyTests {
         #expect(FileManager.default.fileExists(atPath: liveOwner.path))
     }
 
+    @Test func staleUITestRootsAreReclaimedWithoutTouchingUnprovenOrLiveRoots() throws {
+        let fileManager = FileManager.default
+        let temporary = fileManager.temporaryDirectory.appendingPathComponent(
+            "RawLight-UITestCleanup-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try fileManager.createDirectory(at: temporary, withIntermediateDirectories: false)
+        defer { try? fileManager.removeItem(at: temporary) }
+
+        let currentID = UUID()
+        let staleID = UUID()
+        let liveID = UUID()
+        let malformedID = UUID()
+        let symlinkID = UUID()
+        let appPrefix = "RawLight-UITests-"
+        let cachePrefix = "RawLight-UICache-"
+        let markerName = ".RawLight.ui-test-owner.json"
+
+        func root(_ prefix: String, _ id: UUID) -> URL {
+            temporary.appendingPathComponent(prefix + id.uuidString, isDirectory: true)
+        }
+
+        func writeOwner(root: URL, id: UUID, pid: Int32) throws {
+            try fileManager.createDirectory(at: root, withIntermediateDirectories: false)
+            try Data("""
+            { "schemaVersion": 1, "rootID": "\(id.uuidString)", "ownerPID": \(pid) }
+            """.utf8).write(to: root.appendingPathComponent(markerName))
+        }
+
+        let staleApp = root(appPrefix, staleID)
+        let staleCache = root(cachePrefix, staleID)
+        let currentApp = root(appPrefix, currentID)
+        let liveCache = root(cachePrefix, liveID)
+        let malformedApp = root(appPrefix, malformedID)
+        let symlinkApp = root(appPrefix, symlinkID)
+        let symlinkTarget = temporary.appendingPathComponent("SymlinkTarget", isDirectory: true)
+        let unrelated = temporary.appendingPathComponent("Unrelated", isDirectory: true)
+
+        try writeOwner(root: staleApp, id: staleID, pid: Int32.max)
+        try writeOwner(root: staleCache, id: staleID, pid: Int32.max)
+        try writeOwner(root: currentApp, id: currentID, pid: Int32.max)
+        try writeOwner(root: liveCache, id: liveID, pid: getppid())
+        try fileManager.createDirectory(at: malformedApp, withIntermediateDirectories: false)
+        try Data("invalid owner".utf8).write(
+            to: malformedApp.appendingPathComponent(markerName)
+        )
+        try writeOwner(root: symlinkTarget, id: symlinkID, pid: Int32.max)
+        try fileManager.createSymbolicLink(at: symlinkApp, withDestinationURL: symlinkTarget)
+        try fileManager.createDirectory(at: unrelated, withIntermediateDirectories: false)
+
+        LibraryLocations.cleanupStaleUITestRoots(in: temporary, preserving: currentID)
+
+        #expect(!fileManager.fileExists(atPath: staleApp.path))
+        #expect(!fileManager.fileExists(atPath: staleCache.path))
+        #expect(fileManager.fileExists(atPath: currentApp.path))
+        #expect(fileManager.fileExists(atPath: liveCache.path))
+        #expect(fileManager.fileExists(atPath: malformedApp.path))
+        #expect(fileManager.fileExists(atPath: symlinkApp.path))
+        #expect(fileManager.fileExists(atPath: unrelated.path))
+    }
+
     @Test func pointedGenerationWithoutCatalogFailsWithoutCreatingOne() throws {
         let roots = makeRoots()
         let legacyDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(
@@ -590,6 +651,65 @@ struct CatalogGenerationSafetyTests {
         ))
     }
 
+    @Test func interruptedLegacyTargetIsRotatedWhenManagedSidecarChanges() throws {
+        let roots = makeRoots()
+        let legacyDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "RawLight-Legacy-ManagedDrift-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { remove(roots) }
+        try FileManager.default.createDirectory(
+            at: legacyDirectory,
+            withIntermediateDirectories: true
+        )
+        let legacy = legacyDirectory.appendingPathComponent("default.store")
+        let fixture = try writeV4Catalog(at: legacy, legacyLibraryRoot: legacyDirectory)
+        _ = try initializeFreshLibrary(roots)
+
+        LibraryLocations.configureRoots(appRoot: roots.app, cacheRoot: roots.cache)
+        let staleTargetGenerationID: UUID
+        do {
+            let source = try LibraryLocations.prepareCatalog()
+            let migration = try CatalogV4Migration.migrateLegacyStore(
+                at: legacy,
+                legacyLibraryRoot: legacyDirectory,
+                replacing: source
+            )
+            staleTargetGenerationID = migration.preparation.generationID
+            LibraryLocations.abandonCatalogOpen(migration.preparation)
+        }
+        LibraryLocations.resetConfiguredRoots()
+
+        let sourceOriginal = legacyDirectory.appendingPathComponent(fixture.managedRelativePath)
+        let sourceSidecar = SidecarService.sidecarURL(for: sourceOriginal)
+        var modifiedSidecar = try Data(contentsOf: sourceSidecar)
+        modifiedSidecar.append(contentsOf: Data("\n".utf8))
+        try modifiedSidecar.write(to: sourceSidecar, options: .atomic)
+
+        try withConfiguredRoots(roots) {
+            let result = CatalogStore.makeContainer(
+                legacyStoreURL: legacy,
+                legacyLibraryRoot: legacyDirectory
+            )
+            try #require(result.failure == nil)
+            #expect(LibraryLocations.currentGeneration.lastPathComponent
+                != staleTargetGenerationID.uuidString)
+            let targetOriginal = LibraryLocations.currentGeneration.appendingPathComponent(
+                "Originals/\(fixture.firstAssetID.uuidString)/primary.raf"
+            )
+            #expect(try Data(
+                contentsOf: SidecarService.sidecarURL(for: targetOriginal)
+            ) == modifiedSidecar)
+        }
+
+        let staleTarget = generationURL(staleTargetGenerationID, in: roots.app)
+        #expect(FileManager.default.fileExists(
+            atPath: staleTarget.appendingPathComponent(
+                "CatalogMigration.abandoned.json"
+            ).path
+        ))
+    }
+
     @Test func interruptedFirstRunLegacyTargetRevalidatesBeforePublication() throws {
         let roots = makeRoots()
         let legacyDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(
@@ -718,6 +838,138 @@ struct CatalogGenerationSafetyTests {
             LibraryLocations.abandonCatalogOpen(target)
         }
         #expect(FileManager.default.fileExists(atPath: abandonedGeneration.path))
+    }
+
+    @Test func pointerToAbandonedGenerationRecoversCommittedTarget() throws {
+        let roots = makeRoots()
+        let legacyDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "RawLight-Legacy-AbandonedPointer-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { remove(roots) }
+        try FileManager.default.createDirectory(
+            at: legacyDirectory,
+            withIntermediateDirectories: true
+        )
+        let legacy = legacyDirectory.appendingPathComponent("default.store")
+        _ = try writeV4Catalog(at: legacy, legacyLibraryRoot: legacyDirectory)
+        let sourceGenerationID = try initializeFreshLibrary(roots)
+
+        let targetGenerationID: UUID = try withConfiguredRoots(roots) {
+            let result = CatalogStore.makeContainer(
+                legacyStoreURL: legacy,
+                legacyLibraryRoot: legacyDirectory
+            )
+            try #require(result.failure == nil)
+            return try #require(UUID(
+                uuidString: LibraryLocations.currentGeneration.lastPathComponent
+            ))
+        }
+        #expect(targetGenerationID != sourceGenerationID)
+        #expect(FileManager.default.fileExists(
+            atPath: generationURL(sourceGenerationID, in: roots.app)
+                .appendingPathComponent("CatalogMigration.abandoned.json").path
+        ))
+
+        let pointer = roots.app.appendingPathComponent("CurrentLibrary.json")
+        try Data("""
+        { "schemaVersion": 1, "generationID": "\(sourceGenerationID.uuidString)" }
+        """.utf8).write(to: pointer, options: .atomic)
+
+        try withConfiguredRoots(roots) {
+            let result = CatalogStore.makeContainer(legacyStoreURL: nil)
+            try #require(result.failure == nil)
+            #expect(LibraryLocations.currentGeneration.lastPathComponent
+                == targetGenerationID.uuidString)
+            let context = ModelContext(result.container)
+            #expect(try context.fetchCount(FetchDescriptor<ImageAsset>()) == 2)
+            let markerData = try #require(try BoundedFileReader.readRegularFile(
+                at: LibraryLocations.legacyCatalogMigrationCompletionMarkerURL,
+                maximumByteCount: 16 * 1024
+            ))
+            let marker = try JSONDecoder().decode(LegacyMigrationMarker.self, from: markerData)
+            #expect(marker.targetGenerationID == targetGenerationID)
+        }
+        let rewrittenPointer = try Data(contentsOf: pointer)
+        #expect(String(decoding: rewrittenPointer, as: UTF8.self)
+            .contains(targetGenerationID.uuidString))
+    }
+
+    @Test func missingCommittedLegacyTargetDoesNotRestoreRetiredEmptySource() throws {
+        let roots = makeRoots()
+        let restoredRoots = makeRoots()
+        let legacyDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "RawLight-Legacy-MissingCommitted-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer {
+            remove(roots)
+            remove(restoredRoots)
+        }
+        try FileManager.default.createDirectory(
+            at: legacyDirectory,
+            withIntermediateDirectories: true
+        )
+        let legacy = legacyDirectory.appendingPathComponent("default.store")
+        _ = try writeV4Catalog(at: legacy, legacyLibraryRoot: legacyDirectory)
+        let sourceGenerationID = try initializeFreshLibrary(roots)
+
+        let targetGenerationID: UUID = try withConfiguredRoots(roots) {
+            let result = CatalogStore.makeContainer(
+                legacyStoreURL: legacy,
+                legacyLibraryRoot: legacyDirectory
+            )
+            try #require(result.failure == nil)
+            return try #require(UUID(
+                uuidString: LibraryLocations.currentGeneration.lastPathComponent
+            ))
+        }
+        let pointer = roots.app.appendingPathComponent("CurrentLibrary.json")
+        let pointerData = try Data(contentsOf: pointer)
+        let completionData = try Data(
+            contentsOf: roots.app.appendingPathComponent("LegacyCatalogMigration.json")
+        )
+        let restoredLibraries = restoredRoots.app.appendingPathComponent(
+            "Libraries",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: restoredLibraries,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.copyItem(
+            at: generationURL(sourceGenerationID, in: roots.app),
+            to: generationURL(sourceGenerationID, in: restoredRoots.app)
+        )
+        try pointerData.write(
+            to: restoredRoots.app.appendingPathComponent("CurrentLibrary.json")
+        )
+        try completionData.write(
+            to: restoredRoots.app.appendingPathComponent("LegacyCatalogMigration.json")
+        )
+
+        withConfiguredRoots(restoredRoots) {
+            let result = CatalogStore.makeContainer(legacyStoreURL: nil)
+            #expect(result.failure?.message.contains("unavailable") == true)
+            #expect((try? Data(
+                contentsOf: restoredRoots.app.appendingPathComponent("CurrentLibrary.json")
+            )) == pointerData)
+        }
+
+        try withConfiguredRoots(restoredRoots) {
+            let result = CatalogStore.makeContainer(
+                legacyStoreURL: legacy,
+                legacyLibraryRoot: legacyDirectory
+            )
+            try #require(result.failure == nil)
+            let publishedID = try #require(UUID(
+                uuidString: LibraryLocations.currentGeneration.lastPathComponent
+            ))
+            #expect(publishedID != sourceGenerationID)
+            #expect(publishedID != targetGenerationID)
+            let context = ModelContext(result.container)
+            #expect(try context.fetchCount(FetchDescriptor<ImageAsset>()) == 2)
+        }
     }
 
     @Test func validatedCurrentCatalogRecoversBeforeItsMigrationMarkerIsWritten() throws {
@@ -1411,6 +1663,71 @@ struct CatalogGenerationSafetyTests {
             #expect(FileManager.default.fileExists(atPath: backup.path))
             #expect(FileManager.default.fileExists(
                 atPath: LibraryLocations.legacyCatalogMigrationCompletionMarkerURL.path
+            ))
+        }
+    }
+
+    @Test func backupOnlyFirstRunRecoveryRequiresLiveLegacyRevalidation() throws {
+        let roots = makeRoots()
+        let legacyDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "RawLight-Legacy-UnpublishedBackup-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { remove(roots) }
+        try FileManager.default.createDirectory(
+            at: legacyDirectory,
+            withIntermediateDirectories: true
+        )
+        let legacyStore = legacyDirectory.appendingPathComponent("default.store")
+        _ = try writeV4Catalog(
+            at: legacyStore,
+            legacyLibraryRoot: legacyDirectory
+        )
+
+        LibraryLocations.configureRoots(appRoot: roots.app, cacheRoot: roots.cache)
+        let staleGenerationID: UUID
+        do {
+            let preparation = try LibraryLocations.prepareCatalog()
+            let migration = try CatalogV4Migration.migrateLegacyStore(
+                at: legacyStore,
+                legacyLibraryRoot: legacyDirectory,
+                into: preparation
+            )
+            staleGenerationID = migration.preparation.generationID
+            let staleState = migration.preparation.generationURL
+                .appendingPathComponent("ExportState/stale.json")
+            try FileManager.default.createDirectory(
+                at: staleState.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try Data("stale backup state".utf8).write(to: staleState)
+            try detachCatalog(in: migration.preparation.generationURL)
+            LibraryLocations.abandonCatalogOpen(migration.preparation)
+        }
+        LibraryLocations.resetConfiguredRoots()
+        try appendV4Asset(to: legacyStore)
+
+        withConfiguredRoots(roots) {
+            let result = CatalogStore.makeContainer(legacyStoreURL: nil)
+            #expect(result.failure?.message.contains("unavailable") == true)
+            #expect(!FileManager.default.fileExists(
+                atPath: roots.app.appendingPathComponent("CurrentLibrary.json").path
+            ))
+        }
+
+        try withConfiguredRoots(roots) {
+            let result = CatalogStore.makeContainer(
+                legacyStoreURL: legacyStore,
+                legacyLibraryRoot: legacyDirectory
+            )
+            try #require(result.failure == nil)
+            #expect(LibraryLocations.currentGeneration.lastPathComponent
+                != staleGenerationID.uuidString)
+            let context = ModelContext(result.container)
+            #expect(try context.fetchCount(FetchDescriptor<ImageAsset>()) == 3)
+            #expect(!FileManager.default.fileExists(
+                atPath: LibraryLocations.currentGeneration
+                    .appendingPathComponent("ExportState/stale.json").path
             ))
         }
     }

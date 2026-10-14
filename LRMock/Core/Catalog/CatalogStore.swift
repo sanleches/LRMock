@@ -87,17 +87,23 @@ enum CatalogStore {
             var migrationSourceLease: CatalogV4Migration.SourceLease?
             if FileManager.default.fileExists(atPath: prepared.catalogURL.path)
                 || prepared.migrationSourceURL != nil {
-                let migration = try CatalogV4Migration.migrateStoreIfNeeded(prepared)
-                prepared = migration.preparation
-                preparation = prepared
-                legacySourceIdentity = migration.legacySourceIdentity
-                migrationSourceLease = migration.sourceLease
-                if let pendingLegacySourceIdentity = legacySourceIdentity,
-                   migrationSourceLease == nil,
-                   prepared.requiresLegacySourceRevalidation,
+                let migrationStoreURL = prepared.migrationSourceURL ?? prepared.catalogURL
+                let recoveredLegacySourceIdentity: CatalogV4Migration.SourceIdentity?
+                if prepared.requiresLegacySourceRevalidation,
+                   FileManager.default.fileExists(atPath: migrationStoreURL.path) {
+                    recoveredLegacySourceIdentity = try CatalogV4Migration
+                        .pendingLegacySourceIdentity(
+                        at: migrationStoreURL,
+                        generationID: prepared.generationID
+                    )
+                } else {
+                    recoveredLegacySourceIdentity = nil
+                }
+                let migration: CatalogV4Migration.MigrationResult
+                if let recoveredLegacySourceIdentity,
                    try !LibraryLocations.legacyMigrationCompletionMatches(
                     at: LibraryLocations.legacyCatalogMigrationCompletionMarkerURL,
-                    sourceIdentity: pendingLegacySourceIdentity,
+                    sourceIdentity: recoveredLegacySourceIdentity,
                     targetGenerationID: prepared.generationID
                    ) {
                     if let legacyStoreURL { failureURL = legacyStoreURL }
@@ -106,42 +112,70 @@ enum CatalogStore {
                     else {
                         throw StoreError.unavailableLegacyMigrationSource
                     }
-                    failureURL = legacyStoreURL
-                    let legacyRecovery = try CatalogV4Migration.migrateLegacyStore(
+                    migration = try CatalogV4Migration.migrateLegacyStore(
                         at: legacyStoreURL,
                         legacyLibraryRoot: legacyLibraryRoot,
                         replacing: prepared
                     )
-                    prepared = legacyRecovery.preparation
-                    preparation = prepared
-                    legacySourceIdentity = legacyRecovery.legacySourceIdentity
-                    migrationSourceLease = legacyRecovery.sourceLease
+                } else {
+                    migration = try CatalogV4Migration.migrateStoreIfNeeded(prepared)
                 }
+                prepared = migration.preparation
+                preparation = prepared
+                legacySourceIdentity = migration.legacySourceIdentity
+                migrationSourceLease = migration.sourceLease
                 // A legacy-derived current catalog remains authoritative even if
                 // the user later deletes every catalog entity.
                 if migrationSourceLease == nil,
-                   legacySourceIdentity == nil,
-                   let legacyStoreURL,
-                   FileManager.default.fileExists(atPath: legacyStoreURL.path) {
+                   legacySourceIdentity == nil {
                     let currentProbe = try CatalogV4Migration.probeStore(
                         at: prepared.catalogURL
                     )
-                    if currentProbe.isEmpty,
-                       try !LibraryLocations.legacyMigrationWasCompleted(
-                        at: LibraryLocations.legacyCatalogMigrationCompletionMarkerURL
-                       ) {
-                        failureURL = legacyStoreURL
-                        let legacyProbe = try CatalogV4Migration.probeStore(at: legacyStoreURL)
-                        if legacyProbe.format.isLegacy, !legacyProbe.isEmpty {
-                            let legacyMigration = try CatalogV4Migration.migrateLegacyStore(
-                                at: legacyStoreURL,
-                                legacyLibraryRoot: legacyLibraryRoot,
-                                replacing: prepared
+                    if currentProbe.isEmpty {
+                        let legacyMigrationWasCompleted = try LibraryLocations
+                            .legacyMigrationWasCompleted(
+                                at: LibraryLocations
+                                    .legacyCatalogMigrationCompletionMarkerURL
                             )
-                            prepared = legacyMigration.preparation
-                            preparation = prepared
-                            legacySourceIdentity = legacyMigration.legacySourceIdentity
-                            migrationSourceLease = legacyMigration.sourceLease
+                        let recordedTargetIsMissing: Bool
+                        if prepared.requiresLegacySourceRevalidation,
+                           legacyMigrationWasCompleted {
+                            recordedTargetIsMissing = try LibraryLocations
+                                .legacyMigrationTargetIsMissing(
+                                at: LibraryLocations
+                                    .legacyCatalogMigrationCompletionMarkerURL,
+                                appRoot: LibraryLocations.appRoot
+                            )
+                        } else {
+                            recordedTargetIsMissing = false
+                        }
+                        let requiresLegacyRecovery = prepared.requiresLegacySourceRevalidation
+                            && recordedTargetIsMissing
+                        if let legacyStoreURL { failureURL = legacyStoreURL }
+                        if (requiresLegacyRecovery || !legacyMigrationWasCompleted),
+                           let legacyStoreURL,
+                           FileManager.default.fileExists(atPath: legacyStoreURL.path) {
+                            let legacyProbe = try CatalogV4Migration.probeStore(
+                                at: legacyStoreURL
+                            )
+                            guard !requiresLegacyRecovery
+                                    || (legacyProbe.format.isLegacy && !legacyProbe.isEmpty)
+                            else {
+                                throw StoreError.unavailableLegacyMigrationSource
+                            }
+                            if legacyProbe.format.isLegacy, !legacyProbe.isEmpty {
+                                let legacyMigration = try CatalogV4Migration.migrateLegacyStore(
+                                    at: legacyStoreURL,
+                                    legacyLibraryRoot: legacyLibraryRoot,
+                                    replacing: prepared
+                                )
+                                prepared = legacyMigration.preparation
+                                preparation = prepared
+                                legacySourceIdentity = legacyMigration.legacySourceIdentity
+                                migrationSourceLease = legacyMigration.sourceLease
+                            }
+                        } else if requiresLegacyRecovery {
+                            throw StoreError.unavailableLegacyMigrationSource
                         }
                     }
                 }
