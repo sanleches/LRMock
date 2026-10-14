@@ -9,46 +9,167 @@
 
 import SwiftUI
 
-private struct PreviewTaskID: Equatable {
+nonisolated enum DevelopPreviewRenderIntent: Equatable, Sendable {
+    case display
+    case pointColorSampling
+}
+
+nonisolated struct DevelopPreviewRequestIdentity: Equatable, Sendable {
     let assetID: UUID
     let settings: DevelopSettings
+    let renderIntent: DevelopPreviewRenderIntent
+    let interactivePixels: Int
+    let settledPixels: Int
+}
+
+nonisolated struct DevelopPreviewFailure: Equatable, Sendable {
+    let identity: DevelopPreviewRequestIdentity
+    let message: String
+}
+
+struct DevelopPreviewFrame {
+    let identity: DevelopPreviewRequestIdentity
+    let image: CGImage
+}
+
+private nonisolated enum DevelopPreviewRequestIntent: Equatable, Sendable {
+    case interactive
+    case settled
+    case pointColorSampling
+}
+
+actor PreviewRasterizationGate {
+    static let shared = PreviewRasterizationGate()
+
+    private struct Waiter {
+        let id: UUID
+        let continuation: CheckedContinuation<Void, Error>
+    }
+
+    private var holder: UUID?
+    private var waiters: [Waiter] = []
+    private var queueObservers: [CheckedContinuation<Void, Never>] = []
+
+    func withPermit<T: Sendable>(
+        _ operation: @Sendable () async throws -> T
+    ) async throws -> T {
+        let id = UUID()
+        try await acquire(id)
+        defer { release(id) }
+        try Task.checkCancellation()
+        return try await operation()
+    }
+
+    func queuedRequestCount() -> Int {
+        waiters.count
+    }
+
+    func waitForQueuedRequest() async {
+        guard waiters.isEmpty else { return }
+        await withCheckedContinuation { continuation in
+            queueObservers.append(continuation)
+        }
+    }
+
+    private func acquire(_ id: UUID) async throws {
+        try Task.checkCancellation()
+        if holder == nil {
+            holder = id
+            return
+        }
+
+        do {
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation {
+                    (continuation: CheckedContinuation<Void, Error>) in
+                    waiters.append(Waiter(id: id, continuation: continuation))
+                    let observers = queueObservers
+                    queueObservers.removeAll()
+                    for observer in observers { observer.resume() }
+                }
+            } onCancel: {
+                Task { await self.cancelWaiting(id) }
+            }
+            try Task.checkCancellation()
+        } catch {
+            if holder == id { release(id) }
+            throw error
+        }
+    }
+
+    private func cancelWaiting(_ id: UUID) {
+        guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
+        let waiter = waiters.remove(at: index)
+        waiter.continuation.resume(throwing: CancellationError())
+    }
+
+    private func release(_ id: UUID) {
+        guard holder == id else { return }
+        guard !waiters.isEmpty else {
+            holder = nil
+            return
+        }
+        let next = waiters.removeFirst()
+        holder = next.id
+        next.continuation.resume()
+    }
 }
 
 @MainActor
 @Observable
 final class DevelopPreviewRenderer {
-    private enum Intent { case interactive, settled }
-
-    private struct Request {
-        let assetID: UUID
+    private struct Request: Sendable {
+        let identity: DevelopPreviewRequestIdentity
         let source: AssetFileAccess.Reference
-        let settings: DevelopSettings
         let pipeline: RawPipeline
         let generation: UInt64
         let maxPixelSize: Int
-        let intent: Intent
+        let intent: DevelopPreviewRequestIntent
+
+        var assetID: UUID { identity.assetID }
+        var settings: DevelopSettings { identity.settings }
     }
 
-    private struct CachedRender {
-        let assetID: UUID
-        let settings: DevelopSettings
-        let image: CGImage
-    }
-
-    var rendered: CGImage?
+    private(set) var renderedFrame: DevelopPreviewFrame?
     var isRendering = false
-    var errorMessage: String?
-    var settledImage: CGImage?
+    private(set) var failure: DevelopPreviewFailure?
+    private(set) var settledFrame: DevelopPreviewFrame?
     var settledVersion = 0
+    var failureVersion = 0
 
-    @ObservationIgnored private var currentAssetID: UUID?
+    var rendered: CGImage? {
+        guard renderedFrame?.identity == currentIdentity else { return nil }
+        return renderedFrame?.image
+    }
+    var errorMessage: String? {
+        guard failure?.identity == currentIdentity else { return nil }
+        return failure?.message
+    }
+    var settledImage: CGImage? {
+        guard settledFrame?.identity == currentIdentity else { return nil }
+        return settledFrame?.image
+    }
+    var settledAssetID: UUID? {
+        guard settledFrame?.identity == currentIdentity else { return nil }
+        return settledFrame?.identity.assetID
+    }
+    var settledSettings: DevelopSettings? {
+        guard settledFrame?.identity == currentIdentity else { return nil }
+        return settledFrame?.identity.settings
+    }
+    var settledRenderIntent: DevelopPreviewRenderIntent? {
+        guard settledFrame?.identity == currentIdentity else { return nil }
+        return settledFrame?.identity.renderIntent
+    }
+
+    @ObservationIgnored private var currentIdentity: DevelopPreviewRequestIdentity?
     @ObservationIgnored private var generation: UInt64 = 0
     @ObservationIgnored private var displayedGeneration: UInt64 = 0
     @ObservationIgnored private var pendingInteractive: Request?
     @ObservationIgnored private var pendingSettled: Request?
     @ObservationIgnored private var worker: Task<Void, Never>?
     @ObservationIgnored private var settleTask: Task<Void, Never>?
-    @ObservationIgnored private var settledCache: [CachedRender] = []
+    @ObservationIgnored private var settledCache: [DevelopPreviewFrame] = []
 
     func submit(
         assetID: UUID,
@@ -56,36 +177,55 @@ final class DevelopPreviewRenderer {
         settings: DevelopSettings,
         pipeline: RawPipeline,
         interactivePixels: Int,
-        settledPixels: Int
+        settledPixels: Int,
+        renderIntent: DevelopPreviewRenderIntent = .display
     ) {
+        let identity = DevelopPreviewRequestIdentity(
+            assetID: assetID,
+            settings: settings,
+            renderIntent: renderIntent,
+            interactivePixels: interactivePixels,
+            settledPixels: settledPixels
+        )
         generation &+= 1
         let requestGeneration = generation
-        if currentAssetID != assetID {
-            currentAssetID = assetID
-            rendered = nil
-            settledImage = nil
-            errorMessage = nil
+        failure = nil
+        if currentIdentity?.assetID != assetID {
+            renderedFrame = nil
+            settledFrame = nil
         }
+        currentIdentity = identity
 
         settleTask?.cancel()
         pendingSettled = nil
 
-        if let cached = settledCache.last(where: {
-            $0.assetID == assetID && $0.settings == settings
-        }) {
+        if let cached = settledCache.last(where: { $0.identity == identity }) {
             pendingInteractive = nil
-            rendered = cached.image
-            settledImage = cached.image
+            renderedFrame = cached
+            settledFrame = cached
             displayedGeneration = requestGeneration
             settledVersion &+= 1
             isRendering = worker != nil
             return
         }
 
+        if renderIntent == .pointColorSampling {
+            pendingInteractive = nil
+            pendingSettled = Request(
+                identity: identity,
+                source: source,
+                pipeline: pipeline,
+                generation: requestGeneration,
+                maxPixelSize: settledPixels,
+                intent: .pointColorSampling
+            )
+            startWorkerIfNeeded()
+            return
+        }
+
         pendingInteractive = Request(
-            assetID: assetID,
+            identity: identity,
             source: source,
-            settings: settings,
             pipeline: pipeline,
             generation: requestGeneration,
             maxPixelSize: interactivePixels,
@@ -97,12 +237,11 @@ final class DevelopPreviewRenderer {
             try? await Task.sleep(for: .milliseconds(220))
             guard !Task.isCancelled, let self,
                   self.generation == requestGeneration,
-                  self.currentAssetID == assetID
+                  self.currentIdentity == identity
             else { return }
             self.pendingSettled = Request(
-                assetID: assetID,
+                identity: identity,
                 source: source,
-                settings: settings,
                 pipeline: pipeline,
                 generation: requestGeneration,
                 maxPixelSize: settledPixels,
@@ -117,10 +256,11 @@ final class DevelopPreviewRenderer {
         settleTask?.cancel()
         worker?.cancel()
         settleTask = nil
-        worker = nil
         pendingInteractive = nil
         pendingSettled = nil
-        isRendering = false
+        // A decoder may ignore cancellation. Keep ownership until drainQueue
+        // actually exits so a replacement request cannot start concurrently.
+        isRendering = worker != nil
     }
 
     private func startWorkerIfNeeded() {
@@ -158,52 +298,110 @@ final class DevelopPreviewRenderer {
         do {
             let handle = try AssetFileAccess.open(request.source)
             defer { handle.release() }
-            let result = try await request.pipeline.renderPreview(
-                fileURL: handle.url,
-                settings: request.settings,
-                maxPixelSize: request.maxPixelSize,
-                quality: request.intent == .interactive ? .interactive : .settled
+            let fileURL = handle.url
+            let result = try await PreviewRasterizationGate.shared.withPermit {
+                switch request.intent {
+                case .interactive, .settled:
+                    try await request.pipeline.renderPreview(
+                        fileURL: fileURL,
+                        settings: request.settings,
+                        maxPixelSize: request.maxPixelSize,
+                        quality: request.intent == .interactive ? .interactive : .settled
+                    )
+                case .pointColorSampling:
+                    try await request.pipeline.renderPointColorSamplingPreview(
+                        fileURL: fileURL,
+                        settings: request.settings,
+                        maxPixelSize: request.maxPixelSize
+                    )
+                }
+            }
+            guard !Task.isCancelled,
+                  request.assetID == currentIdentity?.assetID else { return }
+            let frame = DevelopPreviewFrame(
+                identity: request.identity,
+                image: result.cgImage
             )
-            guard !Task.isCancelled, request.assetID == currentAssetID else { return }
 
             switch request.intent {
             case .interactive:
                 // Serialized completions are monotonic. Showing a just-finished
                 // frame while a newer one is pending provides fluid, bounded lag.
                 guard request.generation > displayedGeneration else { return }
-                rendered = result.cgImage
+                renderedFrame = frame
                 displayedGeneration = request.generation
-                errorMessage = nil
-            case .settled:
-                guard request.generation == generation else { return }
-                rendered = result.cgImage
-                settledImage = result.cgImage
+                if request.identity == currentIdentity { failure = nil }
+            case .settled, .pointColorSampling:
+                guard request.generation == generation,
+                      request.identity == currentIdentity else { return }
+                renderedFrame = frame
+                settledFrame = frame
                 displayedGeneration = request.generation
-                errorMessage = nil
+                failure = nil
                 settledVersion &+= 1
-                settledCache.removeAll {
-                    $0.assetID == request.assetID && $0.settings == request.settings
-                }
-                settledCache.append(CachedRender(
-                    assetID: request.assetID,
-                    settings: request.settings,
-                    image: result.cgImage
-                ))
+                settledCache.removeAll { $0.identity == request.identity }
+                settledCache.append(frame)
                 if settledCache.count > 2 { settledCache.removeFirst() }
             }
         } catch is CancellationError {
             return
         } catch {
-            guard request.generation == generation, request.assetID == currentAssetID else { return }
-            if rendered == nil { errorMessage = error.localizedDescription }
+            guard request.generation == generation,
+                  request.identity == currentIdentity else { return }
+            if request.intent == .pointColorSampling
+                || renderedFrame?.identity != request.identity {
+                failure = DevelopPreviewFailure(
+                    identity: request.identity,
+                    message: error.localizedDescription
+                )
+                failureVersion &+= 1
+            }
         }
+    }
+
+    func renderedImage(matching identity: DevelopPreviewRequestIdentity) -> CGImage? {
+        guard renderedFrame?.identity == identity else { return nil }
+        return renderedFrame?.image
+    }
+
+    func failureMessage(matching identity: DevelopPreviewRequestIdentity) -> String? {
+        guard failure?.identity == identity else { return nil }
+        return failure?.message
     }
 }
 
 struct DevelopPreview: View {
     let asset: ImageAsset
     let settings: DevelopSettings
+    var renderIntent: DevelopPreviewRenderIntent = .display
+    var onFailure: (DevelopPreviewFailure) -> Void = { _ in }
     var onRender: (CGImage) -> Void = { _ in }
+
+    init(
+        asset: ImageAsset,
+        settings: DevelopSettings,
+        renderIntent: DevelopPreviewRenderIntent = .display,
+        onRender: @escaping (CGImage) -> Void = { _ in }
+    ) {
+        self.asset = asset
+        self.settings = settings
+        self.renderIntent = renderIntent
+        self.onRender = onRender
+    }
+
+    init(
+        asset: ImageAsset,
+        settings: DevelopSettings,
+        renderIntent: DevelopPreviewRenderIntent = .display,
+        onFailure: @escaping (DevelopPreviewFailure) -> Void,
+        onRender: @escaping (CGImage) -> Void
+    ) {
+        self.asset = asset
+        self.settings = settings
+        self.renderIntent = renderIntent
+        self.onFailure = onFailure
+        self.onRender = onRender
+    }
 
     @Environment(AppServices.self) private var services
     @State private var renderer = DevelopPreviewRenderer()
@@ -211,19 +409,32 @@ struct DevelopPreview: View {
     private let interactivePixels = 1280
     private let settledPixels = 2400
 
+    private var requestIdentity: DevelopPreviewRequestIdentity {
+        DevelopPreviewRequestIdentity(
+            assetID: asset.id,
+            settings: settings,
+            renderIntent: renderIntent,
+            interactivePixels: interactivePixels,
+            settledPixels: settledPixels
+        )
+    }
+
     var body: some View {
+        let identity = requestIdentity
+        let rendered = renderer.renderedImage(matching: identity)
+        let error = renderer.failureMessage(matching: identity)
         ZStack {
-            if let rendered = renderer.rendered {
+            if let rendered {
                 Image(decorative: rendered, scale: 1, orientation: .up)
                     .resizable()
                     .scaledToFit()
-            } else if let error = renderer.errorMessage {
+            } else if let error {
                 missingState(error)
             } else {
                 ProgressView().tint(Theme.textSecondary)
             }
 
-            if renderer.isRendering && renderer.rendered != nil {
+            if renderer.isRendering && rendered != nil {
                 ProgressView()
                     .tint(.white)
                     .padding(8)
@@ -232,18 +443,26 @@ struct DevelopPreview: View {
                     .padding()
             }
         }
-        .task(id: PreviewTaskID(assetID: asset.id, settings: settings)) {
+        .task(id: identity) {
             renderer.submit(
                 assetID: asset.id,
                 source: AssetFileAccess.Reference(asset: asset),
                 settings: settings,
                 pipeline: services.pipeline,
                 interactivePixels: interactivePixels,
-                settledPixels: settledPixels
+                settledPixels: settledPixels,
+                renderIntent: renderIntent
             )
         }
         .onChange(of: renderer.settledVersion) { _, _ in
-            if let image = renderer.settledImage { onRender(image) }
+            guard renderer.settledFrame?.identity == identity,
+                  let frame = renderer.settledFrame else { return }
+            onRender(frame.image)
+        }
+        .onChange(of: renderer.failureVersion) { _, _ in
+            guard let failure = renderer.failure,
+                  failure.identity == identity else { return }
+            onFailure(failure)
         }
         .onDisappear { renderer.cancel() }
     }

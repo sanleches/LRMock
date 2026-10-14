@@ -81,16 +81,26 @@ struct CropView: View {
 
     private var toolbar: some View {
         HStack(spacing: 16) {
-            Button("Reset") { resetGeometry() }
-                .tint(Theme.accent)
+            Button(action: resetGeometry) {
+                Text("Reset")
+                    .frame(minWidth: controlSize, minHeight: controlSize, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .tint(Theme.accent)
+            .help("Reset Crop and Geometry")
             Spacer()
             Text("Crop & Rotate").font(.headline).foregroundStyle(Theme.textPrimary)
             Spacer()
-            Button("Done", action: onDone)
-                .tint(Theme.accent)
-                .fontWeight(.semibold)
+            Button(action: onDone) {
+                Text("Done")
+                    .frame(minWidth: controlSize, minHeight: controlSize, alignment: .trailing)
+                    .contentShape(Rectangle())
+            }
+            .tint(Theme.accent)
+            .fontWeight(.semibold)
         }
-        .padding(.horizontal, 20).padding(.vertical, 12)
+        .padding(.horizontal, 20)
+        .padding(.vertical, toolbarVerticalPadding)
         .background(Theme.panel)
     }
 
@@ -108,12 +118,17 @@ struct CropView: View {
                         } label: {
                             Text(preset.rawValue)
                                 .font(.system(size: 13, weight: .medium))
-                                .padding(.horizontal, 14).padding(.vertical, 7)
+                                .padding(.horizontal, 14)
+                                .frame(minHeight: controlSize)
                                 .background(aspect == preset ? Theme.accent : Theme.surface,
                                             in: Capsule())
                                 .foregroundStyle(aspect == preset ? .white : Theme.textSecondary)
+                                .contentShape(Capsule())
                         }
                         .buttonStyle(.plain)
+                        .help("\(preset.rawValue) Aspect")
+                        .accessibilityLabel("\(preset.rawValue) crop aspect")
+                        .accessibilityAddTraits(aspect == preset ? .isSelected : [])
                     }
                 }
                 .padding(.horizontal, 16)
@@ -124,6 +139,9 @@ struct CropView: View {
                 Image(systemName: "angle").foregroundStyle(Theme.textSecondary)
                 Slider(value: $asset.develop.straighten, in: -45...45)
                     .tint(Theme.accent)
+                    .frame(minHeight: controlSize)
+                    .accessibilityLabel("Straighten")
+                    .accessibilityValue("\(Int(asset.develop.straighten)) degrees")
                 Text("\(Int(asset.develop.straighten))°")
                     .font(.system(size: 12).monospacedDigit())
                     .foregroundStyle(Theme.textSecondary)
@@ -133,10 +151,20 @@ struct CropView: View {
 
             // Rotate / flip
             HStack(spacing: 22) {
-                iconButton("rotate.left") { asset.develop.rotationQuarterTurns -= 1 }
-                iconButton("rotate.right") { asset.develop.rotationQuarterTurns += 1 }
-                iconButton("arrow.left.and.right.righttriangle.left.righttriangle.right") { asset.develop.flipH.toggle() }
-                iconButton("arrow.up.and.down.righttriangle.up.righttriangle.down") { asset.develop.flipV.toggle() }
+                iconButton("rotate.left", label: "Rotate Left") {
+                    asset.develop.rotationQuarterTurns -= 1
+                }
+                iconButton("rotate.right", label: "Rotate Right") {
+                    asset.develop.rotationQuarterTurns += 1
+                }
+                iconButton("arrow.left.and.right.righttriangle.left.righttriangle.right",
+                           label: "Flip Horizontal") {
+                    asset.develop.flipH.toggle()
+                }
+                iconButton("arrow.up.and.down.righttriangle.up.righttriangle.down",
+                           label: "Flip Vertical") {
+                    asset.develop.flipV.toggle()
+                }
             }
             .padding(.bottom, 8)
         }
@@ -144,11 +172,21 @@ struct CropView: View {
         .background(Theme.panel)
     }
 
-    private func iconButton(_ system: String, _ action: @escaping () -> Void) -> some View {
+    private func iconButton(
+        _ system: String,
+        label: String,
+        _ action: @escaping () -> Void
+    ) -> some View {
         Button(action: action) {
-            Image(systemName: system).font(.system(size: 18)).foregroundStyle(Theme.textPrimary)
+            Image(systemName: system)
+                .font(.system(size: 18))
+                .foregroundStyle(Theme.textPrimary)
+                .frame(width: controlSize, height: controlSize)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .help(label)
+        .accessibilityLabel(label)
     }
 
     // MARK: Geometry helpers
@@ -177,9 +215,28 @@ struct CropView: View {
         asset.develop.cropX = 0; asset.develop.cropY = 0
         asset.develop.cropW = 1; asset.develop.cropH = 1
         asset.develop.straighten = 0
+        asset.develop.geometryVertical = 0; asset.develop.geometryHorizontal = 0
+        asset.develop.geometryAspect = 0; asset.develop.geometryScale = 1
+        asset.develop.geometryOffsetX = 0; asset.develop.geometryOffsetY = 0
         asset.develop.flipH = false; asset.develop.flipV = false
         asset.develop.rotationQuarterTurns = 0
         aspect = .free
+    }
+
+    private var controlSize: CGFloat {
+        #if os(iOS)
+        44
+        #else
+        28
+        #endif
+    }
+
+    private var toolbarVerticalPadding: CGFloat {
+        #if os(iOS)
+        2
+        #else
+        8
+        #endif
     }
 }
 

@@ -12,12 +12,17 @@ import SwiftData
 struct PhotoGridView: View {
     let title: String
     let assets: [ImageAsset]
+    let folders: [LibraryFolder]
+    let collections: [AssetCollection]
     @Binding var selectedAsset: ImageAsset?
+    let autosaver: SidecarAutosaver
     var onOpen: (ImageAsset) -> Void
 
     @Environment(\.modelContext) private var modelContext
     @State private var cellSize: Double = 180
-    @State private var assetPendingRemoval: ImageAsset?
+    @State private var isSelecting = false
+    @State private var selectedAssetIDs: Set<UUID> = []
+    @State private var assetsPendingRemoval: [ImageAsset] = []
     @State private var operationError: String?
 
     private var columns: [GridItem] {
@@ -37,10 +42,16 @@ struct PhotoGridView: View {
                         ForEach(assets) { asset in
                             AssetGridCell(
                                 asset: asset,
-                                isSelected: selectedAsset?.persistentModelID == asset.persistentModelID
+                                isFocused: selectedAsset?.id == asset.id,
+                                isSelected: selectedAssetIDs.contains(asset.id),
+                                showsSelection: isSelecting
                             )
-                            .onTapGesture { selectedAsset = asset }
-                            .onTapGesture(count: 2) { onOpen(asset) }
+                            .contentShape(Rectangle())
+                            .onTapGesture(count: 2) {
+                                guard !isSelecting else { return }
+                                onOpen(asset)
+                            }
+                            .onTapGesture { handleTap(on: asset) }
                             .contextMenu { contextMenu(for: asset) }
                         }
                     }
@@ -50,24 +61,20 @@ struct PhotoGridView: View {
         }
         .background(Theme.canvas)
         .accessibilityIdentifier("photo-grid")
+        .onChange(of: assets.map(\.id)) { _, ids in
+            pruneSelection(to: Set(ids))
+        }
         .confirmationDialog(
-            "Remove Photo?",
-            isPresented: Binding(
-                get: { assetPendingRemoval != nil },
-                set: { if !$0 { assetPendingRemoval = nil } }
-            ),
-            presenting: assetPendingRemoval
-        ) { asset in
+            removalTitle,
+            isPresented: removalPresented,
+            titleVisibility: .visible
+        ) {
             Button("Remove from Library", role: .destructive) {
-                remove(asset)
+                removeFromLibrary(assetsPendingRemoval)
             }
             Button("Cancel", role: .cancel) {}
-        } message: { asset in
-            if asset.storageMode == .managed {
-                Text("The managed original and its recipe will move to RawLight Trash so they can be recovered. This does not permanently erase the file.")
-            } else {
-                Text("The catalog record will be removed. The referenced original and its sidecar will remain untouched.")
-            }
+        } message: {
+            Text(removalMessage)
         }
         .alert("Operation Failed", isPresented: Binding(
             get: { operationError != nil },
@@ -88,17 +95,27 @@ struct PhotoGridView: View {
         } label: { Label("Open", systemImage: "arrow.up.left.and.arrow.down.right") }
 
         Button {
-            mutate(asset) { asset.flag = (asset.flag == .picked) ? .unflagged : .picked }
-        } label: { Label("Pick", systemImage: "flag") }
+            beginSelection(with: asset)
+        } label: { Label("Select Photo", systemImage: "checkmark.circle") }
+
+        Divider()
 
         Button {
-            mutate(asset) { asset.flag = (asset.flag == .rejected) ? .unflagged : .rejected }
-        } label: { Label("Reject", systemImage: "xmark.circle") }
+            setFlag(.picked, for: [asset])
+        } label: { Label("Mark as Pick", systemImage: "flag") }
+
+        Button {
+            setFlag(.rejected, for: [asset])
+        } label: { Label("Mark as Rejected", systemImage: "xmark.circle") }
+
+        Button {
+            setFlag(.unflagged, for: [asset])
+        } label: { Label("Clear Flag", systemImage: "flag.slash") }
 
         Menu("Rating") {
             ForEach(0...5, id: \.self) { stars in
                 Button {
-                    mutate(asset) { asset.rating = stars }
+                    setRating(stars, for: [asset])
                 } label: {
                     Text(stars == 0 ? "None" : String(repeating: "★", count: stars))
                 }
@@ -107,60 +124,320 @@ struct PhotoGridView: View {
 
         Divider()
 
+        Menu("Move to Folder") {
+            folderActions(for: [asset])
+        }
+
+        if !collections.isEmpty {
+            Menu("Add to Collection") {
+                collectionAddActions(for: [asset])
+            }
+        }
+
+        let memberships = collectionsContaining(anyOf: [asset])
+        if !memberships.isEmpty {
+            Menu("Remove from Collection") {
+                collectionRemoveActions(for: [asset], collections: memberships)
+            }
+        }
+
+        Divider()
+
         Button {
-            DevelopClipboard.settings = asset.develop
+            DevelopClipboard.copy(asset.develop, from: clipboardSource(for: asset))
         } label: { Label("Copy Settings", systemImage: "doc.on.doc") }
 
         Button {
-            mutate(asset) { DevelopClipboard.paste(onto: &asset.develop) }
+            let targetSource = clipboardSource(for: asset)
+            mutateDevelop(asset) {
+                DevelopClipboard.paste(onto: &asset.develop, targetSource: targetSource)
+            }
         } label: { Label("Paste Settings", systemImage: "doc.on.clipboard") }
-            .disabled(DevelopClipboard.settings == nil)
+            .disabled(!DevelopClipboard.hasSettings)
 
         Divider()
 
         Button(role: .destructive) {
-            assetPendingRemoval = asset
+            assetsPendingRemoval = [asset]
         } label: { Label("Remove from Library", systemImage: "trash") }
     }
 
-    private func remove(_ asset: ImageAsset) {
-        var trashReceipt: LibraryTrash.Receipt?
-        do {
-            try modelContext.save()
-            if asset.storageMode == .managed, let relative = asset.managedRelativePath {
-                trashReceipt = try LibraryTrash.moveManagedAsset(
-                    id: asset.id,
-                    originalFilename: asset.originalFilename,
-                    managedRelativePath: relative
-                )
+    private func clipboardSource(for asset: ImageAsset) -> DevelopClipboard.SourceIdentity {
+        DevelopClipboard.SourceIdentity(
+            libraryIdentifier: LibraryLocations.currentGeneration.standardizedFileURL.path,
+            assetID: asset.id,
+            contentDigest: asset.contentDigest,
+            fingerprint: asset.fingerprint
+        )
+    }
+
+    @ViewBuilder
+    private var bulkActions: some View {
+        Menu {
+            Menu("Rating") {
+                ForEach(0...5, id: \.self) { stars in
+                    Button(stars == 0 ? "No Rating" : String(repeating: "★", count: stars)) {
+                        setRating(stars, for: selectedAssets)
+                    }
+                }
             }
 
-            let id = asset.id
-            let wasSelected = selectedAsset?.persistentModelID == asset.persistentModelID
-            modelContext.delete(asset)
-            do {
-                try modelContext.save()
-            } catch {
-                modelContext.rollback()
-                try? trashReceipt?.restore()
-                throw error
+            Menu("Flag") {
+                Button("Mark as Pick") { setFlag(.picked, for: selectedAssets) }
+                Button("Mark as Rejected") { setFlag(.rejected, for: selectedAssets) }
+                Button("Clear Flag") { setFlag(.unflagged, for: selectedAssets) }
             }
-            if wasSelected { selectedAsset = nil }
-            assetPendingRemoval = nil
-            Task { await ThumbnailService.shared.invalidate(id) }
+
+            Menu("Move to Folder") {
+                folderActions(for: selectedAssets)
+            }
+
+            if !collections.isEmpty {
+                Menu("Add to Collection") {
+                    collectionAddActions(for: selectedAssets)
+                }
+            }
+
+            let memberships = collectionsContaining(anyOf: selectedAssets)
+            if !memberships.isEmpty {
+                Menu("Remove from Collection") {
+                    collectionRemoveActions(for: selectedAssets, collections: memberships)
+                }
+            }
+
+            Divider()
+            Button("Remove from Library", role: .destructive) {
+                assetsPendingRemoval = selectedAssets
+            }
+        } label: {
+            Label("Actions", systemImage: "ellipsis.circle")
+        }
+        .accessibilityIdentifier("bulk-actions-menu")
+        .disabled(selectedAssetIDs.isEmpty)
+    }
+
+    @ViewBuilder
+    private func folderActions(for subjects: [ImageAsset]) -> some View {
+        Button {
+            move(subjects, to: nil)
+        } label: {
+            Label("No Folder", systemImage: all(subjects, areIn: nil) ? "checkmark" : "tray")
+        }
+        Divider()
+        ForEach(folders) { folder in
+            Button {
+                move(subjects, to: folder)
+            } label: {
+                Label(
+                    folder.name,
+                    systemImage: all(subjects, areIn: folder) ? "checkmark" : "folder"
+                )
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func collectionAddActions(for subjects: [ImageAsset]) -> some View {
+        ForEach(collections) { collection in
+            let alreadyContainsAll = subjects.allSatisfy { subject in
+                subject.collections.contains { $0.id == collection.id }
+            }
+            Button {
+                add(subjects, to: collection)
+            } label: {
+                Label(
+                    collection.name,
+                    systemImage: alreadyContainsAll ? "checkmark" : collection.symbol
+                )
+            }
+            .disabled(alreadyContainsAll)
+        }
+    }
+
+    @ViewBuilder
+    private func collectionRemoveActions(
+        for subjects: [ImageAsset],
+        collections memberships: [AssetCollection]
+    ) -> some View {
+        ForEach(memberships) { collection in
+            Button {
+                remove(subjects, from: collection)
+            } label: {
+                Label(collection.name, systemImage: "minus.circle")
+            }
+        }
+    }
+
+    // MARK: Selection and mutations
+
+    private var selectedAssets: [ImageAsset] {
+        assets.filter { selectedAssetIDs.contains($0.id) }
+    }
+
+    private var mutations: LibraryMutationService {
+        LibraryMutationService(modelContext: modelContext)
+    }
+
+    private var removalPresented: Binding<Bool> {
+        Binding(
+            get: { !assetsPendingRemoval.isEmpty },
+            set: { if !$0 { assetsPendingRemoval = [] } }
+        )
+    }
+
+    private var removalTitle: String {
+        assetsPendingRemoval.count == 1
+            ? "Remove Photo?"
+            : "Remove \(assetsPendingRemoval.count) Photos?"
+    }
+
+    private var removalMessage: String {
+        let hasManaged = assetsPendingRemoval.contains { $0.storageMode == .managed }
+        let hasReferenced = assetsPendingRemoval.contains { $0.storageMode == .referenced }
+        switch (hasManaged, hasReferenced) {
+        case (true, true):
+            return "Managed originals and recipes move to RawLight Trash. Referenced originals and sidecars remain untouched."
+        case (true, false):
+            return "Managed originals and recipes move to RawLight Trash so they remain recoverable."
+        case (false, true):
+            return "Only catalog records are removed. Referenced originals and sidecars remain untouched."
+        default:
+            return "No photos will be removed."
+        }
+    }
+
+    private func handleTap(on asset: ImageAsset) {
+        if isSelecting {
+            if selectedAssetIDs.contains(asset.id) {
+                selectedAssetIDs.remove(asset.id)
+            } else {
+                selectedAssetIDs.insert(asset.id)
+            }
+        } else {
+            selectedAsset = asset
+        }
+    }
+
+    private func beginSelection(with asset: ImageAsset? = nil) {
+        isSelecting = true
+        selectedAsset = nil
+        if let asset { selectedAssetIDs.insert(asset.id) }
+    }
+
+    private func endSelection() {
+        isSelecting = false
+        selectedAssetIDs.removeAll()
+    }
+
+    private func toggleSelectAll() {
+        let allIDs = Set(assets.map(\.id))
+        if selectedAssetIDs == allIDs {
+            selectedAssetIDs.removeAll()
+        } else {
+            selectedAssetIDs = allIDs
+        }
+    }
+
+    private func pruneSelection(to availableIDs: Set<UUID>) {
+        selectedAssetIDs.formIntersection(availableIDs)
+        if let selectedAsset, !availableIDs.contains(selectedAsset.id) {
+            self.selectedAsset = nil
+        }
+        if isSelecting, selectedAssetIDs.isEmpty, availableIDs.isEmpty {
+            isSelecting = false
+        }
+    }
+
+    private func setRating(_ rating: Int, for subjects: [ImageAsset]) {
+        do {
+            try mutations.setRating(rating, for: subjects)
+            persistPortableMetadata(for: subjects)
         } catch {
-            try? trashReceipt?.restore()
             operationError = error.localizedDescription
         }
     }
 
-    private func mutate(_ asset: ImageAsset, _ mutation: () -> Void) {
+    private func setFlag(_ flag: PickFlag, for subjects: [ImageAsset]) {
+        do {
+            try mutations.setFlag(flag, for: subjects)
+            persistPortableMetadata(for: subjects)
+        } catch {
+            operationError = error.localizedDescription
+        }
+    }
+
+    private func move(_ subjects: [ImageAsset], to folder: LibraryFolder?) {
+        do {
+            try mutations.move(subjects, to: folder)
+        } catch {
+            operationError = error.localizedDescription
+        }
+    }
+
+    private func add(_ subjects: [ImageAsset], to collection: AssetCollection) {
+        do {
+            try mutations.add(subjects, to: collection)
+        } catch {
+            operationError = error.localizedDescription
+        }
+    }
+
+    private func remove(_ subjects: [ImageAsset], from collection: AssetCollection) {
+        do {
+            try mutations.remove(subjects, from: collection)
+        } catch {
+            operationError = error.localizedDescription
+        }
+    }
+
+    private func removeFromLibrary(_ subjects: [ImageAsset]) {
+        do {
+            let removedIDs = try mutations.removeFromLibrary(subjects)
+            let removed = Set(removedIDs)
+            selectedAssetIDs.subtract(removed)
+            if let selectedAsset, removed.contains(selectedAsset.id) {
+                self.selectedAsset = nil
+            }
+            assetsPendingRemoval = []
+            if selectedAssetIDs.isEmpty { isSelecting = false }
+            Task {
+                for id in removedIDs {
+                    await ThumbnailService.shared.invalidate(id)
+                }
+            }
+        } catch {
+            operationError = error.localizedDescription
+        }
+    }
+
+    private func mutateDevelop(_ asset: ImageAsset, _ mutation: () -> Void) {
         mutation()
         do {
             try modelContext.save()
-            try EditPersistence.writeSidecar(for: asset)
+            persistPortableMetadata(for: [asset])
         } catch {
+            modelContext.rollback()
             operationError = error.localizedDescription
+        }
+    }
+
+    private func persistPortableMetadata(for subjects: [ImageAsset]) {
+        Task {
+            for asset in subjects {
+                await autosaver.flush(asset)
+            }
+        }
+    }
+
+    private func all(_ subjects: [ImageAsset], areIn folder: LibraryFolder?) -> Bool {
+        guard !subjects.isEmpty else { return false }
+        return subjects.allSatisfy { $0.folder?.id == folder?.id }
+    }
+
+    private func collectionsContaining(anyOf subjects: [ImageAsset]) -> [AssetCollection] {
+        let subjectIDs = Set(subjects.map(\.id))
+        return collections.filter { collection in
+            collection.assets.contains { subjectIDs.contains($0.id) }
         }
     }
 
@@ -176,12 +453,36 @@ struct PhotoGridView: View {
             }
             Spacer()
 
-            if let selectedAsset {
+            if isSelecting {
+                Text("\(selectedAssetIDs.count) selected")
+                    .font(.subheadline.monospacedDigit())
+                    .foregroundStyle(Theme.textSecondary)
+
+                Button(selectedAssetIDs.count == assets.count ? "Deselect All" : "Select All") {
+                    toggleSelectAll()
+                }
+                .disabled(assets.isEmpty)
+
+                bulkActions
+
+                Button("Done") { endSelection() }
+                    .keyboardShortcut(.escape, modifiers: [])
+            } else if let selectedAsset {
                 Button { onOpen(selectedAsset) } label: {
                     Label("Open", systemImage: "arrow.up.left.and.arrow.down.right")
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(Theme.accent)
+            }
+
+            if !isSelecting {
+                Button {
+                    beginSelection()
+                } label: {
+                    Label("Select", systemImage: "checkmark.circle")
+                }
+                .accessibilityIdentifier("select-photos-button")
+                .disabled(assets.isEmpty)
             }
 
             HStack(spacing: 8) {
@@ -199,7 +500,9 @@ struct PhotoGridView: View {
 /// A single thumbnail cell with rating / flag / edited overlays.
 struct AssetGridCell: View {
     let asset: ImageAsset
+    let isFocused: Bool
     let isSelected: Bool
+    let showsSelection: Bool
 
     var body: some View {
         VStack(spacing: 6) {
@@ -213,15 +516,35 @@ struct AssetGridCell: View {
                 .overlay { overlays.padding(6) }
                 .overlay(
                     RoundedRectangle(cornerRadius: 8)
-                        .strokeBorder(isSelected ? Theme.accent : .clear, lineWidth: 3)
+                        .strokeBorder(
+                            isSelected || isFocused ? Theme.accent : .clear,
+                            lineWidth: isSelected ? 3 : 2
+                        )
                 )
+                .overlay(alignment: .topTrailing) {
+                    if showsSelection {
+                        Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                            .font(.title3.weight(.semibold))
+                            .symbolRenderingMode(.palette)
+                            .foregroundStyle(
+                                isSelected ? Color.white : Color.white.opacity(0.9),
+                                isSelected ? Theme.accent : Color.black.opacity(0.5)
+                            )
+                            .padding(8)
+                    }
+                }
 
             Text(asset.originalFilename)
                 .font(.caption)
                 .lineLimit(1)
                 .truncationMode(.middle)
-                .foregroundStyle(isSelected ? Theme.textPrimary : Theme.textSecondary)
+                .foregroundStyle(isSelected || isFocused ? Theme.textPrimary : Theme.textSecondary)
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(asset.originalFilename)
+        .accessibilityValue(isSelected ? "Selected" : "")
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .accessibilityIdentifier("asset-\(asset.id.uuidString)")
     }
 
     private var overlays: some View {

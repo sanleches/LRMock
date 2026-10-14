@@ -15,16 +15,26 @@ import CoreImage
 
 nonisolated final class CoreImagePipeline: RawPipeline {
 
+    private static var workingColorSpace: CGColorSpace {
+        CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3)!
+    }
+
     /// Fast context for interactive previews (skips high-quality downsampling).
     private let interactiveContext: CIContext
     /// High-quality context for settled previews and exports.
     private let qualityContext: CIContext
+    private let nativeDecoder: CoreImageAdjustments.NativeDecoder
 
     /// Previews at or below this longest edge use the fast interactive context.
     private let interactiveThreshold = 1600
 
-    init() {
-        let workingSpace = CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3)!
+    init(
+        nativeDecoder: @escaping CoreImageAdjustments.NativeDecoder = {
+            RawNativeDecoder.developedImage(request: $0)
+        }
+    ) {
+        let workingSpace = Self.workingColorSpace
+        self.nativeDecoder = nativeDecoder
         self.interactiveContext = CIContext(options: [
             .useSoftwareRenderer: false,
             .highQualityDownsample: false,
@@ -51,7 +61,9 @@ nonisolated final class CoreImagePipeline: RawPipeline {
             fileURL,
             settings: settings,
             maxPixelSize: maxPixelSize,
-            quality: quality
+            quality: quality,
+            intent: .display,
+            nativeDecoder: nativeDecoder
         )
         try Task.checkCancellation()
         let adjusted = CoreImageAdjustments.apply(
@@ -69,6 +81,42 @@ nonisolated final class CoreImagePipeline: RawPipeline {
         )
     }
 
+    func renderPointColorSamplingPreview(
+        fileURL: URL,
+        settings: DevelopSettings,
+        maxPixelSize: Int
+    ) async throws -> RenderedImage {
+        try Task.checkCancellation()
+
+        let decoded = try CoreImageAdjustments.decode(
+            fileURL,
+            settings: settings,
+            maxPixelSize: maxPixelSize,
+            quality: .settled,
+            intent: .pointColorSampling,
+            nativeDecoder: nativeDecoder
+        )
+        try Task.checkCancellation()
+
+        let pointColorInput = CoreImageAdjustments.applyPointColorInput(
+            to: decoded.image,
+            settings: settings,
+            includeBasics: !decoded.isRAW,
+            quality: .settled
+        )
+        // Geometry would interpolate colours that never entered Point Color.
+        // Return the exact pre-Point-Color image and invert viewport geometry
+        // when mapping the user's tap instead.
+        let scaled = CoreImageAdjustments.downscale(pointColorInput, maxPixelSize: maxPixelSize)
+        try Task.checkCancellation()
+        return try CoreImageAdjustments.rasterize(
+            scaled,
+            context: qualityContext,
+            colorSpace: Self.workingColorSpace,
+            format: .RGBAh
+        )
+    }
+
     func export(
         fileURL: URL,
         settings: DevelopSettings,
@@ -80,7 +128,9 @@ nonisolated final class CoreImagePipeline: RawPipeline {
             fileURL,
             settings: settings,
             maxPixelSize: nil,
-            quality: .settled
+            quality: .settled,
+            intent: .display,
+            nativeDecoder: nativeDecoder
         )
         var image = CoreImageAdjustments.apply(
             to: decoded.image, settings: settings,

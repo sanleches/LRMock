@@ -42,7 +42,10 @@ nonisolated enum LibraryTrash {
         managedRelativePath: String
     ) throws -> Receipt {
         let fm = FileManager.default
-        let originalURL = try LibraryLocations.url(forManagedRelativePath: managedRelativePath)
+        let originalURL = try LibraryLocations.url(
+            forManagedRelativePath: managedRelativePath,
+            expectedAssetID: id
+        )
         let originalDirectory = originalURL.deletingLastPathComponent()
         let recipeURL = LibraryLocations.recipeURL(assetID: id)
         let packageURL = LibraryLocations.trash
@@ -53,15 +56,6 @@ nonisolated enum LibraryTrash {
 
         do {
             try fm.createDirectory(at: packageURL, withIntermediateDirectories: true)
-            if fm.fileExists(atPath: originalDirectory.path) {
-                try fm.moveItem(at: originalDirectory, to: trashedOriginal)
-                completedMoves.append((originalDirectory, trashedOriginal))
-            }
-            if fm.fileExists(atPath: recipeURL.path) {
-                try fm.moveItem(at: recipeURL, to: trashedRecipe)
-                completedMoves.append((recipeURL, trashedRecipe))
-            }
-
             let manifest = Manifest(
                 assetID: id,
                 originalFilename: originalFilename,
@@ -73,6 +67,16 @@ nonisolated enum LibraryTrash {
                 to: packageURL.appendingPathComponent("Manifest.json"),
                 options: [.atomic]
             )
+
+            if fm.fileExists(atPath: originalDirectory.path) {
+                try fm.moveItem(at: originalDirectory, to: trashedOriginal)
+                completedMoves.append((originalDirectory, trashedOriginal))
+            }
+            if fm.fileExists(atPath: recipeURL.path) {
+                try fm.moveItem(at: recipeURL, to: trashedRecipe)
+                completedMoves.append((recipeURL, trashedRecipe))
+            }
+
             return Receipt(packageURL: packageURL, moves: completedMoves)
         } catch {
             let receipt = Receipt(packageURL: packageURL, moves: completedMoves)

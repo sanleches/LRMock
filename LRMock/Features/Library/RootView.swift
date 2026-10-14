@@ -13,6 +13,7 @@ import UniformTypeIdentifiers
 
 struct RootView: View {
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.scenePhase) private var scenePhase
 
     // Catalog queries used to resolve the current selection.
     @Query(sort: \LibraryFolder.sortIndex) private var folders: [LibraryFolder]
@@ -35,14 +36,29 @@ struct RootView: View {
     @State private var importMessageID = UUID()
     @State private var isImporting = false
     @State private var operationError: String?
+    @State private var sidecarAutosaver = SidecarAutosaver()
 
     private var importContentTypes: [UTType] {
-        importMode == .folder ? [.folder] : [.image, .rawImage]
+        guard importMode != .folder else { return [.folder] }
+        var types: [UTType] = [.image, .rawImage]
+        if let sidecar = UTType(filenameExtension: SidecarService.fileExtension) {
+            types.append(sidecar)
+        }
+        return types
     }
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
-            FolderSidebar(selection: $selection, onNewCollection: createCollection)
+            FolderSidebar(
+                selection: $selection,
+                onCreateFolder: createFolder,
+                onCreateCollection: createCollection,
+                onRenameFolder: renameFolder,
+                onRenameCollection: renameCollection,
+                onDeleteFolder: deleteFolder,
+                onDeleteCollection: deleteCollection,
+                onSelectionActivated: navigateToGrid
+            )
                 .navigationSplitViewColumnWidth(min: 230, ideal: 270, max: 340)
                 .toolbar { importToolbar }
         } detail: {
@@ -61,25 +77,25 @@ struct RootView: View {
         }
         .overlay(alignment: .bottom) { importToast }
         .alert("Operation Failed", isPresented: Binding(
-            get: { operationError != nil },
-            set: { if !$0 { operationError = nil } }
+            get: { operationError != nil || sidecarAutosaver.lastError != nil },
+            set: { if !$0 { dismissErrors() } }
         )) {
-            Button("OK", role: .cancel) { operationError = nil }
+            if sidecarAutosaver.hasUnsavedChanges {
+                Button("Retry Saving Edits", action: retrySidecars)
+            }
+            Button("OK", role: .cancel, action: dismissErrors)
         } message: {
-            Text(operationError ?? "Unknown error")
+            Text(presentedError)
         }
         // Picking a folder/collection in the sidebar always returns to its grid,
         // even from the full-screen editor.
         .onChange(of: selection) { _, _ in
-            if let selectedAsset { persistSidecar(for: selectedAsset) }
-            selectedAsset = nil
-            if isLoupeOpen {
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    isLoupeOpen = false
-                    columnVisibility = .all
-                }
-            }
+            returnToGrid()
         }
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active { flushPersistence() }
+        }
+        .onDisappear(perform: flushPersistence)
     }
 
     // MARK: Detail (grid ↔ loupe)
@@ -90,13 +106,17 @@ struct RootView: View {
             LoupeView(
                 assets: currentAssets,
                 selectedAsset: $selectedAsset,
+                autosaver: sidecarAutosaver,
                 onClose: closeLoupe
             )
         } else {
             PhotoGridView(
                 title: currentTitle,
                 assets: currentAssets,
+                folders: folders,
+                collections: collections,
                 selectedAsset: $selectedAsset,
+                autosaver: sidecarAutosaver,
                 onOpen: openLoupe
             )
         }
@@ -206,6 +226,22 @@ struct RootView: View {
         }
     }
 
+    private func navigateToGrid(_ destination: LibrarySelection) {
+        selection = destination
+        guard isLoupeOpen else { return }
+        returnToGrid()
+    }
+
+    private func returnToGrid() {
+        if let selectedAsset { persistSidecar(for: selectedAsset) }
+        selectedAsset = nil
+        guard isLoupeOpen else { return }
+        withAnimation(.easeInOut(duration: 0.2)) {
+            isLoupeOpen = false
+            columnVisibility = .all
+        }
+    }
+
     // MARK: Import handlers
 
     private func handleFileImport(_ result: Result<[URL], Error>) {
@@ -234,7 +270,7 @@ struct RootView: View {
                 let folder = LibraryFolder(
                     name: folderURL.lastPathComponent,
                     kind: .external,
-                    sortIndex: folders.count
+                    sortIndex: (folders.map(\.sortIndex).max() ?? -1) + 1
                 )
                 folder.bookmarkData = bookmark
                 modelContext.insert(folder)
@@ -258,32 +294,106 @@ struct RootView: View {
 
     // MARK: Actions
 
-    private func createCollection() {
-        let collection = AssetCollection(name: "New Collection", sortIndex: collections.count)
-        modelContext.insert(collection)
+    private func createFolder(_ name: String) {
         do {
-            try modelContext.save()
+            let folder = try mutations.createFolder(name: name)
+            selection = .folder(folder.persistentModelID)
         } catch {
-            modelContext.delete(collection)
             operationError = error.localizedDescription
         }
+    }
+
+    private func createCollection(_ name: String) {
+        do {
+            let collection = try mutations.createCollection(name: name)
+            selection = .collection(collection.persistentModelID)
+        } catch {
+            operationError = error.localizedDescription
+        }
+    }
+
+    private func renameFolder(_ folder: LibraryFolder, _ name: String) {
+        do {
+            try mutations.rename(folder: folder, to: name)
+        } catch {
+            operationError = error.localizedDescription
+        }
+    }
+
+    private func renameCollection(_ collection: AssetCollection, _ name: String) {
+        do {
+            try mutations.rename(collection: collection, to: name)
+        } catch {
+            operationError = error.localizedDescription
+        }
+    }
+
+    private func deleteFolder(_ folder: LibraryFolder) {
+        let destination = LibrarySelection.folder(folder.persistentModelID)
+        do {
+            try mutations.delete(folder: folder)
+            if selection == destination { selection = .allPhotos }
+        } catch {
+            operationError = error.localizedDescription
+        }
+    }
+
+    private func deleteCollection(_ collection: AssetCollection) {
+        let destination = LibrarySelection.collection(collection.persistentModelID)
+        do {
+            try mutations.delete(collection: collection)
+            if selection == destination { selection = .allPhotos }
+        } catch {
+            operationError = error.localizedDescription
+        }
+    }
+
+    private var mutations: LibraryMutationService {
+        LibraryMutationService(modelContext: modelContext)
     }
 
     private func persistSidecar(for asset: ImageAsset) {
         do {
             try modelContext.save()
-            try EditPersistence.writeSidecar(for: asset)
         } catch {
             operationError = error.localizedDescription
         }
+        Task { await sidecarAutosaver.flush(asset) }
+    }
+
+    private func flushPersistence() {
+        do {
+            try modelContext.save()
+        } catch {
+            operationError = error.localizedDescription
+        }
+        Task { await sidecarAutosaver.flushAll() }
+    }
+
+    private func dismissErrors() {
+        operationError = nil
+        sidecarAutosaver.dismissError()
+    }
+
+    private var presentedError: String {
+        [operationError, sidecarAutosaver.lastError]
+            .compactMap { $0 }
+            .joined(separator: "\n\n")
+    }
+
+    private func retrySidecars() {
+        sidecarAutosaver.dismissError()
+        Task { await sidecarAutosaver.flushAll() }
     }
 
     private func show(_ summary: ImportService.Summary) {
         let text = "Imported \(summary.imported)"
             + (summary.skipped > 0 ? " · skipped \(summary.skipped)" : "")
             + (summary.failed > 0 ? " · failed \(summary.failed)" : "")
-        if !summary.errors.isEmpty {
-            operationError = summary.errors.prefix(5).joined(separator: "\n")
+            + (summary.restoredSidecars > 0 ? " · restored edits \(summary.restoredSidecars)" : "")
+        let notices = summary.errors + summary.warnings
+        if !notices.isEmpty {
+            operationError = notices.prefix(5).joined(separator: "\n")
         }
         let messageID = UUID()
         importMessageID = messageID

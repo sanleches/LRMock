@@ -5,3 +5,5 @@ DerivedData/
 xcuserdata/
 .DS_Store
 .playwright-mcp
+.fake
+.sf

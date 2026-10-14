@@ -11,8 +11,11 @@ import SwiftUI
 
 struct ToneCurveEditor: View {
     @Binding var points: [CurvePoint]
+    var onEditingChanged: (Bool, UUID) -> Bool = { _, _ in true }
 
     @State private var dragging: Int?
+    @State private var editingOwner: UUID?
+    @GestureState private var dragGestureActive = false
 
     var body: some View {
         GeometryReader { geo in
@@ -30,6 +33,10 @@ struct ToneCurveEditor: View {
             .gesture(dragGesture(size: size))
         }
         .aspectRatio(1, contentMode: .fit)
+        .onChange(of: dragGestureActive) { wasActive, isActive in
+            if wasActive, !isActive { finishDrag() }
+        }
+        .onDisappear { finishDrag() }
     }
 
     // MARK: Pieces
@@ -70,8 +77,12 @@ struct ToneCurveEditor: View {
 
     private func dragGesture(size: CGSize) -> some Gesture {
         DragGesture(minimumDistance: 0)
+            .updating($dragGestureActive) { _, isActive, _ in
+                isActive = true
+            }
             .onChanged { g in
                 if dragging == nil {
+                    guard beginEditingOwnership() else { return }
                     dragging = nearestIndex(to: g.location, size: size)
                 }
                 guard let i = dragging else { return }
@@ -79,7 +90,27 @@ struct ToneCurveEditor: View {
                 let y = 1 - Double(g.location.y / size.height)
                 points[i].y = min(1, max(0, y))
             }
-            .onEnded { _ in dragging = nil }
+            .onEnded { _ in finishDrag() }
+    }
+
+    private func finishDrag() {
+        guard dragging != nil else { return }
+        dragging = nil
+        endEditingOwnership()
+    }
+
+    private func beginEditingOwnership() -> Bool {
+        if editingOwner != nil { return true }
+        let owner = UUID()
+        guard onEditingChanged(true, owner) else { return false }
+        editingOwner = owner
+        return true
+    }
+
+    private func endEditingOwnership() {
+        guard let owner = editingOwner else { return }
+        editingOwner = nil
+        _ = onEditingChanged(false, owner)
     }
 
     private func nearestIndex(to location: CGPoint, size: CGSize) -> Int {

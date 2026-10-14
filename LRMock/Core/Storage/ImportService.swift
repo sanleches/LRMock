@@ -19,6 +19,7 @@ nonisolated private struct InspectedImport: Sendable {
     let contentDigest: String
     let bookmarkData: Data?
     let sidecar: Sidecar?
+    let sidecarWarning: String?
 }
 
 @MainActor
@@ -30,7 +31,14 @@ struct ImportService {
         var imported = 0
         var skipped = 0
         var failed = 0
+        var restoredSidecars = 0
         var errors: [String] = []
+        var warnings: [String] = []
+    }
+
+    private struct ImportOutcome {
+        let restoredSidecar: Bool
+        let warning: String?
     }
 
     enum ImportError: LocalizedError {
@@ -62,17 +70,29 @@ struct ImportService {
         copyIntoLibrary: Bool = true
     ) async -> Summary {
         var summary = Summary()
-        for url in urls {
+        let explicitSidecars = Self.explicitSidecars(in: urls)
+        let imageURLs = urls.filter {
+            $0.pathExtension.lowercased() != SidecarService.fileExtension
+        }
+        for url in imageURLs {
+            guard !Task.isCancelled else { break }
             do {
-                try await importOne(
+                let outcome = try await importOne(
                     url,
                     into: folder,
                     copyIntoLibrary: copyIntoLibrary,
-                    manageScope: true
+                    manageScope: true,
+                    explicitSidecarURL: explicitSidecars[url.standardizedFileURL.path]
                 )
                 summary.imported += 1
+                if outcome.restoredSidecar { summary.restoredSidecars += 1 }
+                if let warning = outcome.warning {
+                    summary.warnings.append("\(url.lastPathComponent): \(warning)")
+                }
             } catch ImportError.duplicate {
                 summary.skipped += 1
+            } catch is CancellationError {
+                break
             } catch {
                 summary.failed += 1
                 summary.errors.append("\(url.lastPathComponent): \(error.localizedDescription)")
@@ -88,21 +108,34 @@ struct ImportService {
         let scoped = folderURL.startAccessingSecurityScopedResource()
         defer { if scoped { folderURL.stopAccessingSecurityScopedResource() } }
 
-        let files = await Task.detached(priority: .userInitiated) {
+        let enumeration = Task.detached(priority: .userInitiated) {
             Self.imageFiles(in: folderURL)
-        }.value
+        }
+        let files = await withTaskCancellationHandler {
+            await enumeration.value
+        } onCancel: {
+            enumeration.cancel()
+        }
 
         for url in files {
+            guard !Task.isCancelled else { break }
             do {
-                try await importOne(
+                let outcome = try await importOne(
                     url,
                     into: folder,
                     copyIntoLibrary: false,
-                    manageScope: false
+                    manageScope: false,
+                    explicitSidecarURL: nil
                 )
                 summary.imported += 1
+                if outcome.restoredSidecar { summary.restoredSidecars += 1 }
+                if let warning = outcome.warning {
+                    summary.warnings.append("\(url.lastPathComponent): \(warning)")
+                }
             } catch ImportError.duplicate {
                 summary.skipped += 1
+            } catch is CancellationError {
+                break
             } catch {
                 summary.failed += 1
                 summary.errors.append("\(url.lastPathComponent): \(error.localizedDescription)")
@@ -117,15 +150,18 @@ struct ImportService {
         _ sourceURL: URL,
         into folder: LibraryFolder?,
         copyIntoLibrary: Bool,
-        manageScope: Bool
-    ) async throws {
-        let inspected = try await Task.detached(priority: .userInitiated) {
+        manageScope: Bool,
+        explicitSidecarURL: URL?
+    ) async throws -> ImportOutcome {
+        let inspected = try await Self.runDetached {
             try Self.inspect(
                 sourceURL,
-                includeBookmarkAndSidecar: !copyIntoLibrary,
-                manageScope: manageScope
+                includeBookmark: !copyIntoLibrary,
+                manageScope: manageScope,
+                explicitSidecarURL: explicitSidecarURL
             )
-        }.value
+        }
+        try Task.checkCancellation()
 
         guard try !containsAsset(withDigest: inspected.contentDigest) else {
             throw ImportError.duplicate
@@ -146,38 +182,52 @@ struct ImportService {
             apply(inspected.metadata, to: asset)
             asset.contentDigest = inspected.contentDigest
             asset.folder = folder
+            if let sidecar = inspected.sidecar {
+                asset.develop = sidecar.develop
+                asset.rating = min(max(sidecar.rating, 0), 5)
+                asset.flagRaw = PickFlag(rawValue: sidecar.flag)?.rawValue ?? PickFlag.unflagged.rawValue
+                asset.colorLabel = min(max(sidecar.colorLabel, 0), 5)
+            }
 
             if copyIntoLibrary {
-                let destination = try await Task.detached(priority: .userInitiated) {
+                let destination = try await Self.runDetached {
                     try Self.copyIntoManagedLibrary(
                         inspected.sourceURL,
                         assetID: assetID,
                         expectedDigest: inspected.contentDigest,
                         manageScope: manageScope
                     )
-                }.value
+                }
                 managedDirectory = destination.deletingLastPathComponent()
+                try Task.checkCancellation()
+                guard try !containsAsset(withDigest: inspected.contentDigest) else {
+                    throw ImportError.duplicate
+                }
                 asset.managedRelativePath = try LibraryLocations.relativePath(of: destination)
-                try RecipeStore.write(for: asset)
+                try Task.checkCancellation()
+                let recipe = RecipeDocument(asset: asset)
+                try await Self.runDetached {
+                    try RecipeStore.write(recipe)
+                }
                 recipeWritten = true
             } else {
                 asset.bookmarkData = inspected.bookmarkData
-                if let sidecar = inspected.sidecar {
-                    asset.develop = sidecar.develop
-                    asset.rating = min(max(sidecar.rating, 0), 5)
-                    asset.flagRaw = PickFlag(rawValue: sidecar.flag)?.rawValue ?? PickFlag.unflagged.rawValue
-                    asset.colorLabel = min(max(sidecar.colorLabel, 0), 5)
-                }
             }
 
+            try Task.checkCancellation()
             modelContext.insert(asset)
             do {
+                try Task.checkCancellation()
                 try modelContext.save()
             } catch {
                 modelContext.delete(asset)
                 try? modelContext.save()
                 throw error
             }
+            return ImportOutcome(
+                restoredSidecar: inspected.sidecar != nil,
+                warning: inspected.sidecarWarning
+            )
         } catch {
             if recipeWritten { try? RecipeStore.remove(assetID: assetID) }
             if let managedDirectory {
@@ -201,9 +251,11 @@ struct ImportService {
 
     nonisolated private static func inspect(
         _ sourceURL: URL,
-        includeBookmarkAndSidecar: Bool,
-        manageScope: Bool
+        includeBookmark: Bool,
+        manageScope: Bool,
+        explicitSidecarURL: URL?
     ) throws -> InspectedImport {
+        try Task.checkCancellation()
         let scoped = manageScope && sourceURL.startAccessingSecurityScopedResource()
         defer { if scoped { sourceURL.stopAccessingSecurityScopedResource() } }
 
@@ -227,11 +279,32 @@ struct ImportService {
         let digest = try ContentDigest.sha256(of: sourceURL)
 
         var bookmark: Data?
-        var sidecar: Sidecar?
-        if includeBookmarkAndSidecar {
+        if includeBookmark {
             bookmark = try BookmarkStore.makeBookmark(for: sourceURL)
-            sidecar = try SidecarService.read(for: sourceURL)
-            if let sidecar, sidecar.fingerprint.match(fingerprint).rawValue < ImageFingerprint.MatchStrength.strong.rawValue {
+        }
+        var sidecar: Sidecar?
+        var sidecarWarning: String?
+        do {
+            if let explicitSidecarURL {
+                let sidecarScoped = manageScope
+                    && explicitSidecarURL.startAccessingSecurityScopedResource()
+                defer {
+                    if sidecarScoped {
+                        explicitSidecarURL.stopAccessingSecurityScopedResource()
+                    }
+                }
+                sidecar = try SidecarService.read(at: explicitSidecarURL)
+            } else {
+                sidecar = try SidecarService.read(for: sourceURL)
+            }
+        } catch {
+            guard SidecarService.isAccessDenied(error) else { throw error }
+            sidecarWarning = "The adjacent .rawlight sidecar could not be read with the picker's file-only access. Select the photo and sidecar together to restore its edits."
+        }
+        if let sidecar {
+            if let sidecarDigest = sidecar.sourceContentDigest {
+                guard sidecarDigest == digest else { throw ImportError.sidecarMismatch }
+            } else if sidecar.fingerprint.match(fingerprint).rawValue < ImageFingerprint.MatchStrength.strong.rawValue {
                 throw ImportError.sidecarMismatch
             }
         }
@@ -244,8 +317,17 @@ struct ImportService {
             fingerprint: fingerprint,
             contentDigest: digest,
             bookmarkData: bookmark,
-            sidecar: sidecar
+            sidecar: sidecar,
+            sidecarWarning: sidecarWarning
         )
+    }
+
+    nonisolated private static func explicitSidecars(in urls: [URL]) -> [String: URL] {
+        var result: [String: URL] = [:]
+        for url in urls where url.pathExtension.lowercased() == SidecarService.fileExtension {
+            result[url.deletingPathExtension().standardizedFileURL.path] = url
+        }
+        return result
     }
 
     /// Copies through `Incoming/<transaction>/`, verifies the complete digest,
@@ -256,6 +338,7 @@ struct ImportService {
         expectedDigest: String,
         manageScope: Bool
     ) throws -> URL {
+        try Task.checkCancellation()
         let scoped = manageScope && source.startAccessingSecurityScopedResource()
         defer { if scoped { source.stopAccessingSecurityScopedResource() } }
 
@@ -278,6 +361,7 @@ struct ImportService {
         try fm.createDirectory(at: LibraryLocations.incoming, withIntermediateDirectories: true)
         try fm.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
         try fm.copyItem(at: source, to: staged)
+        try Task.checkCancellation()
         guard try ContentDigest.sha256(of: staged) == expectedDigest else {
             throw ImportError.digestMismatch
         }
@@ -289,6 +373,17 @@ struct ImportService {
         try fm.moveItem(at: stagingDirectory, to: finalDirectory)
         promoted = true
         return destination
+    }
+
+    nonisolated private static func runDetached<T: Sendable>(
+        _ operation: @escaping @Sendable () throws -> T
+    ) async throws -> T {
+        let task = Task.detached(priority: .userInitiated, operation: operation)
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
     }
 
     // MARK: Metadata and enumeration
@@ -316,6 +411,7 @@ struct ImportService {
 
         var result: [URL] = []
         for case let url as URL in enumerator {
+            guard !Task.isCancelled else { break }
             guard supportedExtensions.contains(url.pathExtension.lowercased()),
                   (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
             else { continue }

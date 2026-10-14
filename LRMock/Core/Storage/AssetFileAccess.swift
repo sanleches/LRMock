@@ -20,12 +20,14 @@ nonisolated enum AssetFileAccess {
     /// Sendable location snapshot used by background services without passing a
     /// SwiftData model across actors.
     struct Reference: Sendable {
+        let assetID: UUID
         let storageMode: StorageMode
         let managedRelativePath: String?
         let bookmarkData: Data?
 
         @MainActor
         init(asset: ImageAsset) {
+            assetID = asset.id
             storageMode = asset.storageMode
             managedRelativePath = asset.managedRelativePath
             bookmarkData = asset.bookmarkData
@@ -43,7 +45,19 @@ nonisolated enum AssetFileAccess {
         func release() { onRelease() }
     }
 
-    enum AccessError: Error { case unresolved, scopeDenied }
+    enum AccessError: LocalizedError {
+        case unresolved
+        case scopeDenied
+
+        var errorDescription: String? {
+            switch self {
+            case .unresolved:
+                return "The original file could not be found."
+            case .scopeDenied:
+                return "RawLight no longer has permission to access the referenced original."
+            }
+        }
+    }
 
     /// Opens the asset's original file, beginning scoped access if required.
     @MainActor
@@ -57,7 +71,10 @@ nonisolated enum AssetFileAccess {
             guard let relative = reference.managedRelativePath else {
                 throw AccessError.unresolved
             }
-            let url = try LibraryLocations.url(forManagedRelativePath: relative)
+            let url = try LibraryLocations.url(
+                forManagedRelativePath: relative,
+                expectedAssetID: reference.assetID
+            )
             guard FileManager.default.fileExists(atPath: url.path) else {
                 throw AccessError.unresolved
             }

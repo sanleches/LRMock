@@ -10,24 +10,19 @@ import XCTest
 final class LRMockUITests: XCTestCase {
 
     private var app: XCUIApplication!
-    private var libraryRoot: URL!
-    private var cacheRoot: URL!
 
     override func setUpWithError() throws {
         continueAfterFailure = false
-        libraryRoot = FileManager.default.temporaryDirectory
-            .appendingPathComponent("RawLight-UITests-\(UUID().uuidString)", isDirectory: true)
-        cacheRoot = FileManager.default.temporaryDirectory
-            .appendingPathComponent("RawLight-UICache-\(UUID().uuidString)", isDirectory: true)
         app = XCUIApplication()
-        app.launchEnvironment["RAWLIGHT_LIBRARY_ROOT"] = libraryRoot.path
-        app.launchEnvironment["RAWLIGHT_CACHE_ROOT"] = cacheRoot.path
+        app.launchEnvironment["RAWLIGHT_UI_TEST_ROOT_ID"] = UUID().uuidString
+        app.launchArguments += [
+            "-ApplePersistenceIgnoreState", "YES",
+            "-NSQuitAlwaysKeepsWindows", "NO",
+        ]
     }
 
     override func tearDownWithError() throws {
         app?.terminate()
-        if let libraryRoot { try? FileManager.default.removeItem(at: libraryRoot) }
-        if let cacheRoot { try? FileManager.default.removeItem(at: cacheRoot) }
     }
 
     @MainActor
@@ -46,16 +41,13 @@ final class LRMockUITests: XCTestCase {
 
     @MainActor
     func testUnsupportedLibraryPointerShowsRecovery() throws {
-        try FileManager.default.createDirectory(at: libraryRoot, withIntermediateDirectories: true)
-        let pointer = """
-        { "schemaVersion": 999, "generationID": "\(UUID().uuidString)" }
-        """
-        try Data(pointer.utf8).write(
-            to: libraryRoot.appendingPathComponent("CurrentLibrary.json")
-        )
+        app.launchEnvironment["RAWLIGHT_UI_TEST_POINTER_SCHEMA_VERSION"] = "999"
 
         app.launch()
         XCTAssertTrue(app.staticTexts["Library Could Not Be Opened"].waitForExistence(timeout: 5))
+        let message = app.staticTexts["catalog-recovery-message"]
+        XCTAssertTrue(message.exists)
+        XCTAssertTrue((message.value as? String)?.contains("unsupported version 999") == true)
         XCTAssertTrue(app.buttons["Show Library in Finder"].exists)
     }
 

@@ -25,7 +25,10 @@ enum LibraryReveal {
     }
 
     static func revealLibrary() {
-        let url = LibraryLocations.currentGeneration
+        reveal(LibraryLocations.currentGeneration)
+    }
+
+    static func reveal(_ url: URL) {
         #if os(macOS)
         NSWorkspace.shared.activateFileViewerSelecting([url])
         #endif

@@ -16,10 +16,11 @@ struct CatalogRecoveryView: View {
             Label("Library Could Not Be Opened", systemImage: "externaldrive.badge.exclamationmark")
         } description: {
             Text("RawLight preserved the existing catalog and did not create or delete library data. Close the app, verify the disk is available, then try again.\n\n\(failure.message)")
+                .accessibilityIdentifier("catalog-recovery-message")
         } actions: {
             #if os(macOS)
             Button("Show Library in Finder") {
-                LibraryReveal.revealLibrary()
+                LibraryReveal.reveal(failure.libraryURL)
             }
             #endif
         }

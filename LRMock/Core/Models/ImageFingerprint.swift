@@ -58,7 +58,7 @@ nonisolated extension ImageFingerprint {
         }
         let sameName = filename.caseInsensitiveCompare(other.filename) == .orderedSame
         let sameSize = fileSizeBytes == other.fileSizeBytes
-        let sameDate = captureDate == other.captureDate
+        let sameDate = captureDate != nil && captureDate == other.captureDate
 
         switch (sameName, sameSize, sameDate) {
         case (true, true, true):   return .strong
